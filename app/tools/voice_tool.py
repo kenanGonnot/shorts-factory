@@ -1,50 +1,80 @@
-"""TTS tool. Default: ElevenLabs HTTP. Falls back to silent wav in dev."""
-from __future__ import annotations
-import httpx
+"""Voice generation pipeline stage.
 
-from app.core.config import get_settings
-from app.services.storage import get_storage
+``VoiceTool`` is intentionally thin: it reads pipeline state, picks the
+configured TTS provider, delegates rendering to
+:class:`ScriptVoiceRenderer`, persists the audio + segment metadata, and
+returns an enriched state dict.
+"""
+from __future__ import annotations
+
+import json
+
 from app.chains.state import PipelineState
+from app.core.logging import log
+from app.services.storage import Storage, get_storage
 from app.tools.base import PipelineTool
+from app.voice.providers import VoiceProvider, get_voice_provider
+from app.voice.renderer import ScriptVoiceRenderer
 
 
 class VoiceTool(PipelineTool):
     name = "VoiceTool"
 
+    def __init__(
+        self,
+        provider: VoiceProvider | None = None,
+        storage: Storage | None = None,
+        renderer: ScriptVoiceRenderer | None = None,
+    ) -> None:
+        # All dependencies are lazily resolved at run() time so tests can
+        # instantiate VoiceTool() with no network or storage side effects.
+        self._provider = provider
+        self._storage = storage
+        self._renderer = renderer
+
     def run(self, state: PipelineState) -> PipelineState:
-        s = get_settings()
+        job_id = state["job_id"]
         script = state["script"]
-        text = f"{script['hook']}. {script['body']} {script['cta']}"
-        storage = get_storage()
-        key = f"{state['job_id']}/voice.mp3"
 
-        if s.elevenlabs_api_key:
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{s.elevenlabs_voice_id}"
-            r = httpx.post(
-                url,
-                headers={"xi-api-key": s.elevenlabs_api_key, "accept": "audio/mpeg"},
-                json={"text": text, "model_id": "eleven_turbo_v2"},
-                timeout=120,
-            )
-            r.raise_for_status()
-            audio = r.content
-        else:
-            # silent placeholder mp3 — keeps the pipeline runnable end-to-end in dev
-            audio = _silent_mp3()
+        provider = self._provider or get_voice_provider()
+        renderer = self._renderer or ScriptVoiceRenderer(provider)
+        storage = self._storage or get_storage()
 
-        path = storage.save(key, audio)
-        return {**state, "audio_path": path}
+        result = renderer.render(script)
 
+        audio_key = f"{job_id}/voice.mp3"
+        segments_key = f"{job_id}/voice.segments.json"
 
-def _silent_mp3() -> bytes:
-    # 1 second of silence — minimal valid MP3 frame sequence
-    # In dev we just use ffmpeg to synthesize silence if available.
-    import subprocess
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-             "-t", "10", "-q:a", "9", f.name],
-            check=True, capture_output=True,
+        audio_path = storage.save(audio_key, result.audio)
+        segments_payload = {
+            "job_id": job_id,
+            "voice_provider": result.voice_provider,
+            "voice_id": result.voice_id,
+            "duration_ms": result.duration_ms,
+            "segments": result.segments_as_dicts(),
+        }
+        segments_path = storage.save(
+            segments_key,
+            json.dumps(segments_payload, ensure_ascii=False, indent=2).encode("utf-8"),
         )
-        return open(f.name, "rb").read()
+
+        log.info(
+            "voice.rendered",
+            job_id=job_id,
+            provider=result.voice_provider,
+            voice_id=result.voice_id,
+            segments=len(result.segments),
+            duration_ms=result.duration_ms,
+        )
+
+        enriched: PipelineState = {
+            **state,
+            "audio_path": audio_path,
+            "audio_segments_path": segments_path,
+            "audio_segments": result.segments_as_dicts(),
+            "voice_provider": result.voice_provider,
+            "voice_id": result.voice_id,
+        }
+        if result.duration_ms is not None:
+            enriched["audio_duration_ms"] = result.duration_ms
+        return enriched

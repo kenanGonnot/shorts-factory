@@ -18,8 +18,10 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
 
     # TTS
+    voice_provider: str = "auto"  # auto | elevenlabs | silent
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = "Rachel"
+    elevenlabs_model: str = "eleven_turbo_v2"
 
     # Visuals
     pexels_api_key: str = ""

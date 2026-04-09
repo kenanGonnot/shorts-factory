@@ -14,6 +14,11 @@ class PipelineState(TypedDict, total=False):
     topic: str
     script: Script
     audio_path: str
+    audio_segments_path: str
+    audio_segments: list[dict]
+    audio_duration_ms: int
+    voice_provider: str
+    voice_id: str
     image_paths: list[str]
     video_path: str
     subtitle_path: str

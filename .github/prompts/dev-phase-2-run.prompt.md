@@ -10,7 +10,8 @@ Implementation workflow:
 * After completing each task, mark it as done by changing the checkbox from [ ] to [x]. `implementation-plan.md` to reflect the change you are applying to the project at every step.
 * Before implementing a task, break it into small steps. If any step needs a code change, include a ‘create a unit test’ step
 * Make sure all unit tests pass before starting the next task
-* When all the tasks are completed and the unit tests are working.
+* When all the tasks are completed and the unit tests are working. Create an example python file in the `examples` folder to demonstrate the usage of the implemented solution.
+* After the implementation, create a documentation file in the `docs` folder to explain the implemented solution, its usage, and any relevant details. Ensure the documentation is clear and comprehensive. Put a mermaid diagram in the documentation to explain the architecture of the implemented solution.
 
 Constraints:
 * Ignore backward compatibility. Remove legacy code if needed, and update both the code and documentation.

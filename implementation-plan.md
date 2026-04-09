@@ -1,201 +1,238 @@
-# Implementation Plan — Script Generation Module for Shorts Factory
+# Phase 1 Plan — Voice Generation (TTS) Module
 
 ## 1. Description of the problem
 
-Shorts Factory needs to replace its minimal script-generation entry point with a more robust, implementation-ready
-module that produces structured script data for the rest of the LCEL pipeline.
+Shorts Factory is an LCEL pipeline where each step is a `Runnable[PipelineState, PipelineState]`. The second stage,
+`VoiceTool`, is responsible for transforming the structured script produced by `ScriptChain` into an audio asset that
+downstream steps can reuse.
 
-Today, `app/chains/script_chain.py` uses a lightweight `prompt | ChatOpenAI | JsonOutputParser` flow wrapped in a
-`RunnableLambda`. That shape is simple, but it leaves several phase-1 issues unresolved:
+Today, the implementation in `app/tools/voice_tool.py` is intentionally minimal:
 
-- the returned structure is only loosely enforced
-- content constraints are described in prompt text instead of centralized validation
-- the current logic is not encapsulated in a dedicated class
-- degraded-mode / no-key behavior is not clearly designed at the script stage
-- the future script contract may need to evolve beyond the current `body: str`
+- it concatenates `hook`, `body`, and `cta` into one text string,
+- it calls ElevenLabs directly over HTTP when `ELEVENLABS_API_KEY` is configured,
+- it falls back to ffmpeg-generated silence when no TTS API key is available,
+- it stores one deterministic asset at `job_id/voice.mp3`,
+- it returns only `audio_path` in `PipelineState`.
 
-The repository context from `AGENTS.md`, `README.md`, and `brainstorming.md` makes the target clear:
+That baseline keeps the pipeline runnable, but it is too narrow for the next stage of the project. The voice module now
+needs a design that stays simple while becoming easier to extend and safer to integrate with future features such as:
 
-- the script module is the **first agent** in a larger end-to-end pipeline
-- it must remain compatible with **LangChain LCEL**
-- it must produce **stable structured output** for downstream tools
-- it should be **simple, modular, and testable**
-- it should follow the project’s non-mutation and degraded-mode rules
-- it should be ready for future downstream automation such as subtitles, visuals, and publishing
+- multiple TTS providers,
+- configurable voice parameters,
+- optional timing metadata for subtitles and scene pacing,
+- deterministic, testable degraded mode,
+- clearer separation between provider logic, script normalization, and asset persistence.
 
-There is also one important repo reality to account for in the plan:
+### Repository-specific source note
 
-- `docs/features/` does **not** exist in this workspace, so there is no additional feature document to anchor the
-  implementation plan
+The external planning prompt refers to `project.md` and `docs/features/`, but neither exists in this workspace. For this
+plan, the authoritative sources are:
+
+- `README.md`
+- `AGENTS.md`
+- `brainstorming.md`
+- current implementation files under `app/`
+- existing tests under `tests/`
 
 ---
 
 ## 2. Description of the chosen solution
 
-### Chosen solution
+## Selected solution
 
-The selected direction from `brainstorming.md` is:
+The chosen direction from `brainstorming.md` is:
 
-**A dedicated `ScriptGenerator` class with schema-driven structured output.**
+**Provider abstraction + segment renderer + optional alignment metadata**
 
-### What this solution means in practice
+### Detailed solution description
 
-Instead of keeping script generation as a mostly inline LCEL expression with post-hoc JSON parsing, the implementation
-should introduce a dedicated class that owns the full script-generation lifecycle:
+The implementation should keep `VoiceTool` as the only pipeline-facing `PipelineTool`, while moving the internal TTS
+concerns into smaller, testable building blocks.
 
-- prompt construction
-- model initialization
-- schema-driven output generation
-- business validation
-- fallback / no-key policy
-- conversion to the final `PipelineState["script"]` payload
-- Runnable-compatible integration with `build_pipeline()`
+The target structure is:
 
-This approach keeps the external pipeline usage simple while making the internals much more reliable and testable.
+1. **`VoiceTool` remains the pipeline stage**
+    - Reads `job_id` and `script` from `PipelineState`
+    - Loads settings lazily via `get_settings()`
+    - Chooses the active provider based on configuration
+    - Delegates rendering to a dedicated renderer/service layer
+    - Saves generated artifacts through `get_storage()`
+    - Returns a new enriched state dict without mutating the input
 
-### Research-backed implementation direction
+2. **A provider contract encapsulates TTS backends**
+    - Defines the minimum interface required to synthesize text
+    - Returns audio bytes plus optional metadata
+    - Allows a cloud provider such as ElevenLabs and a local degraded fallback to share one contract
 
-Brief online research plus LangChain documentation strongly supports moving from free-form JSON parsing to schema-driven
-structured output:
+3. **A script renderer owns normalization and chunking**
+    - Accepts the structured script object
+    - Preserves semantic sections (`hook`, `body`, `cta`)
+    - Normalizes punctuation / whitespace for speech quality
+    - Splits large text into renderable chunks if necessary
+    - Produces a final merged audio asset and segment metadata
 
-- LangChain’s current structured-output guidance recommends using `ChatOpenAI.with_structured_output(...)` with a *
-  *Pydantic model** or JSON schema rather than depending only on raw JSON parsing.
-- The documented `method="json_schema"` pattern is designed to return values that conform to the declared schema, which
-  reduces parser fragility and makes validation more explicit.
-- A validated schema object is a better fit for a pipeline that must hand structured data to multiple downstream
-  automation steps.
+4. **Fallback remains first-class**
+    - Degraded mode should stay silent for v1
+    - It must still generate a valid audio file and keep the pipeline end-to-end runnable
+    - The fallback should live behind the same provider abstraction so the pipeline surface stays unchanged
 
-For this repo, that suggests the following architectural direction:
+### Chosen output contract for implementation
 
-1. define a schema model for script output
-2. use `ChatOpenAI.with_structured_output(...)` where possible
-3. keep business-rule validation inside the dedicated class instead of spreading it across prompt text and parsing code
-4. return a plain Python structure that matches the project’s state contract
-5. preserve a Runnable entry point so `build_pipeline()` remains simple
+For the first implementation, the contract should evolve conservatively:
 
-### Relevant notes gathered from `brainstorming.md`
+- keep `audio_path` as the only required output,
+- add optional metadata only when it can be produced cleanly,
+- prefer segment-level metadata over word-level timestamps for v1.
 
-The existing analysis and recorded answers in `brainstorming.md` add useful implementation constraints:
+The most likely optional additions are:
 
-- prefer a **dedicated class** instead of more inline chain wiring
-- keep the implementation **KISS** and avoid a multi-pass repair design in phase 1
-- default output language appears to lean toward **English**, while still allowing topic-aware language handling if
-  explicitly desired
-- there is interest in a **more structured script body** for subtitles/editing later, likely moving beyond a single
-  `body: str`
-- there is interest in **optional metadata** such as estimated duration, pacing notes, or visual cues
-- the fallback policy remains **unclear** because the answer recorded in `brainstorming.md` for the no-key case is
-  ambiguous; this must be clarified before implementation is finalized
+- `audio_segments`
+- `audio_duration_ms`
+- `voice_provider`
+- `voice_id`
 
-### Recommended implementation shape
+### Research notes relevant to implementation
 
-A good phase-1 implementation should likely:
+From the earlier research and current repository constraints:
 
-- introduce a dedicated `ScriptGenerator` class
-- define a strong schema using Pydantic
-- decide whether the public pipeline contract stays minimal or expands now to include structured lines and optional
-  metadata
-- remove the old parser-first flow instead of preserving legacy branches
-- expose a Runnable adapter so the rest of the pipeline does not need to know the internals
+1. **ElevenLabs** offers a `with-timestamps` endpoint that can provide audio plus character-level timing. This means the
+   provider layer should be designed so provider-native timing can be surfaced later without redesigning `VoiceTool`.
+2. **LangChain / LCEL** supports keeping application logic in dedicated classes while exposing only a clean `Runnable`
+   boundary, which aligns with the current `PipelineTool` model.
+3. **Coqui TTS** remains a future candidate for a local provider, which reinforces the value of a provider contract now,
+   even if only one remote provider plus one fallback provider are implemented initially.
+4. **Project conventions in `AGENTS.md`** require lazy initialization, no state mutation, deterministic storage keys,
+   structured logging, and degraded-mode behavior. The chosen solution naturally supports all of those constraints.
+
+### Notes gathered from `brainstorming.md` that should drive implementation
+
+- Keep provider selection configuration-driven for v1.
+- Keep degraded mode silent for v1.
+- Support segment-level timing before word-level timing.
+- Normalize and chunk text, but preserve traceability back to `hook`, `body`, and `cta`.
+- Avoid adding heavy alignment dependencies in the first iteration.
 
 ---
 
-## 3. A detailed implementation plan
+## 3. Detailed implementation plan
 
-### Proposed implementation sequence
+### Phase A — Define the internal voice-domain contract
 
-- [x] Finalize the target script contract before editing code: phase 1 keeps the existing public payload with
-  `title`, `hook`, `body`, `cta`, and `tags`, while richer validation stays internal to the generator.
-  No-key behavior now uses a deterministic degraded-mode fallback instead of fail-fast.
+- [x] Create a small voice-domain model inside `app/` for the implementation, such as typed structures or dataclasses
+  representing voice configuration, rendered audio, and segment metadata.
+- [x] Decide the minimum provider contract for v1 (for example: synthesize text, return audio bytes, optionally return
+  metadata).
+- [x] Define how script sections (`hook`, `body`, `cta`) map to renderable segments while preserving original section
+  identity.
+- [x] Decide the initial optional `PipelineState` additions needed for v1, keeping `audio_path` required and everything
+  else optional.
+- [x] Document deterministic storage key rules for audio and optional metadata artifacts so the implementation remains
+  idempotent by `job_id`.
+- [x] Run all tests and fix failing tests.
 
-- [x] Define the phase-1 schema design on paper inside the implementation work: `StructuredScript` is now the internal
-  Pydantic validation model, and it maps back to the unchanged public `PipelineState["script"]` payload.
+### Phase B — Extend configuration and state safely
 
-- [x] Run all tests and fix failing tests before starting the refactor so the baseline is known (`pytest` and
-  `ruff check app/`). The Python environment was completed locally so the baseline commands now run in `.venv`.
+- [x] Update `app/chains/state.py` to include any optional voice-related output fields selected for v1, such as
+  `audio_segments`, `audio_duration_ms`, `voice_provider`, or `voice_id`.
+- [x] Extend `app/core/config.py` with any new voice settings required by the chosen design, keeping them
+  configuration-driven and default-safe.
+- [x] Review `.env.example` requirements and identify any new public environment variables that must be documented once
+  implementation starts.
+- [x] Verify that configuration defaults preserve current degraded-mode behavior when no TTS credentials are set.
+- [x] Run all tests and fix failing tests.
 
-- [x] Refactor the script-generation architecture by introducing a dedicated `ScriptGenerator` class in the
-  script-generation surface area (either in `app/chains/script_chain.py` or a new adjacent module such as
-  `app/chains/script_generator.py`) and move prompt building, model creation, invocation, validation, and state
-  adaptation into that class.
+### Phase C — Introduce provider abstraction
 
-- [x] Replace the current `JsonOutputParser`-centric path with schema-driven generation using
-  `ChatOpenAI.with_structured_output(...)` and a Pydantic model, preferring `method="json_schema"` and strict schema
-  validation where supported by the current LangChain/OpenAI integration.
+- [x] Add a dedicated provider abstraction under `app/services/` or another appropriate internal module, following the
+  repository guidance for wrappers around external providers.
+- [x] Implement an ElevenLabs provider class that encapsulates HTTP request construction, response validation, and audio
+  extraction, rather than leaving that logic directly inside `VoiceTool`.
+- [x] Implement a fallback provider class that generates valid silent audio while preserving the current “pipeline
+  always runs” guarantee.
+- [x] Make provider initialization lazy so tests can instantiate `VoiceTool` without network dependencies or global side
+  effects.
+- [x] Standardize provider outputs so `VoiceTool` does not need provider-specific branching beyond provider selection.
+- [x] Run all tests and fix failing tests.
 
-- [x] Centralize business-rule validation inside the dedicated class: enforce field presence, non-empty text, tag shape,
-  title limits, body/body-line constraints, and any duration or metadata rules chosen for phase 1.
+### Phase D — Introduce the script voice renderer
 
-- [x] Remove legacy script-generation logic that becomes redundant after the class-based implementation, instead of
-  leaving old parsing branches in place.
+- [x] Create a `ScriptVoiceRenderer`-style component that accepts the structured script and a provider instance.
+- [x] Implement text normalization rules for `hook`, `body`, and `cta` that improve speech cadence without losing
+  traceability.
+- [x] Add chunking behavior for long text sections, especially `body`, while preserving a mapping from source section to
+  rendered chunk.
+- [x] Define how rendered chunks are recombined into one final audio asset for storage.
+- [x] Define the v1 segment metadata format so downstream tools can reason about section timing later.
+- [x] Keep the first iteration focused on segment-level metadata and explicitly defer word-level alignment.
+- [x] Run all tests and fix failing tests.
 
-- [x] Run all tests and fix failing tests after the refactor (`pytest` and `ruff check app/`).
+### Phase E — Refactor `VoiceTool` around the new internals
 
-- [x] Update `app/chains/state.py` to reflect the final chosen script contract for phase 1. The public contract remains
-  minimal, and the type definitions now stay aligned with the runtime payload while using Python 3.10 native typing.
+- [x] Refactor `app/tools/voice_tool.py` so it becomes a thin orchestration layer: read state, choose provider, delegate
+  rendering, store artifacts, return enriched state.
+- [x] Remove provider-specific HTTP and fallback-generation details from `VoiceTool` where they are replaced by
+  dedicated internal classes.
+- [x] Preserve the `PipelineTool` contract, including no in-place mutation, structured logging, and exception
+  propagation.
+- [x] Preserve deterministic output keys such as `job_id/voice.mp3`, and add deterministic metadata keys if optional
+  artifacts are written.
+- [x] Ensure the refactor does not require any change to `app/chains/pipeline.py` unless new imports or organization
+  make that necessary.
+- [x] Run all tests and fix failing tests.
 
-- [x] Update the exported script-chain entry point so the pipeline still composes as a
-  single LCEL expression while delegating script-generation behavior to the new dedicated class.
+### Phase F — Add and adapt automated tests
 
-- [x] No environment-variable or config-surface change was required, so `app/core/config.py` and `.env.example`
-  remain unchanged. Public docs were updated where the runtime behavior changed.
+- [x] Add a dedicated unit test module for `VoiceTool` behavior if none exists yet, covering degraded mode, provider
+  selection, deterministic storage paths, and non-mutation of input state.
+- [x] Add unit tests for the provider abstraction using stubs or monkeypatched HTTP calls rather than real network
+  requests.
+- [x] Add unit tests for the renderer, especially normalization, chunking, segment mapping, and metadata output shape.
+- [x] Adapt `tests/test_pipeline.py` only if the public pipeline contract changes; otherwise preserve it as a smoke test
+  proving composition still works.
+- [x] Review whether any tests need to validate new optional state fields without making them mandatory for unrelated
+  pipeline stages.
+- [x] If method signatures or module locations change, update imports in affected tests to keep the suite consistent
+  with the refactor.
+- [x] Run all tests and fix failing tests.
 
-- [x] Run all tests and fix failing tests after the state/pipeline integration step (`pytest` and `ruff check app/`).
+### Phase G — Documentation and project consistency
 
-- [x] Add focused unit tests for the new script-generation behavior under `tests/`, covering at minimum: successful
-  structured generation, schema validation failures, deterministic no-key behavior or fail-fast behavior (depending on
-  the final decision), language handling expectations, tag validation, and any richer body/metadata mapping introduced
-  in phase 1.
+- [x] Update `README.md` to describe the new voice architecture, configuration options, and degraded-mode behavior once
+  implementation is complete.
+- [x] Update `.env.example` with any new public voice-related settings.
+- [x] Update `AGENTS.md` if the voice agent contract or recommended extension approach changes materially.
+- [x] Verify that the final design still follows the repository rules: no direct unmanaged I/O, no hardcoded secrets, no
+  circular dependency, no state mutation, and degraded mode remains mandatory.
+- [x] Run all tests and fix failing tests.
 
-- [x] Add or update tests for the Runnable/state adapter so it proves that `PipelineState` is enriched without in-place
-  mutation and that the generated payload matches the declared script contract.
+### Phase H — Final validation checklist before merge
 
-- [x] Keep `tests/test_pipeline.py` aligned with the unchanged public script contract and preserve the composition-only
-  smoke-test role.
-
-- [x] Add regression tests for whichever clarification-driven decisions are accepted from `brainstorming.md`, especially
-  if the final design includes English-by-default behavior, same-language passthrough, optional metadata fields, or a
-  richer script-body representation.
-
-- [x] Run all tests and fix failing tests after the test-suite updates (`pytest` and `ruff check app/`).
-
-- [x] Review the implementation against `AGENTS.md` rules: no state mutation, no hardcoded secrets, no unnecessary
-  circular imports, lazy model/client initialization where relevant, and structured logging if any logging is added
-  during the refactor.
-
-- [x] If the refactor meaningfully changes the public script contract or agent behavior, update `AGENTS.md` and
-  `README.md` so the repo documentation matches the new script-generation design.
-
-- [x] Run all tests and fix failing tests one final time, then do a short manual smoke verification of the
-  script-generation entry point in isolation.
-
-### Unit tests likely to be impacted
-
-The plan should assume impact in at least these areas:
-
-- `tests/test_pipeline.py` smoke coverage
-- new isolated unit tests for the dedicated script generator
-- any future tests that depend on the exact shape of `state["script"]`
-
-If the public contract changes from `body: str` to a richer shape, tests will need to be updated deliberately rather
-than shimmed for backward compatibility.
+- [x] Run the full test suite with `pytest` and fix any failing tests.
+- [x] Run `ruff check app/` and fix any lint issues.
+- [x] Perform one manual smoke run of the pipeline in degraded mode to confirm that `VoiceTool` still produces a usable
+  audio artifact without external credentials.
+- [x] Perform one provider-enabled smoke path with stubbed or controlled configuration if possible, without baking
+  secrets into code or tests.
+- [x] Review logs to confirm structured events still include useful `job_id` / tool context.
 
 ---
 
 ## 4. Notes
 
-- No `docs/features/` directory exists in this workspace, so the plan is based on repository code and the existing
-  markdown guidance only.
-- The current dependency set already includes the main tools needed for the chosen approach: `pydantic`, `langchain`,
-  `langchain-core`, and `langchain-openai` are already present in `pyproject.toml`.
-- Because the user requested that backward compatibility not be prioritized, the implementation can remove the old
-  `JsonOutputParser` path instead of preserving parallel legacy behavior.
-- The biggest open design decision is the public script contract for phase 1: either keep the current simple payload for
-  minimal downstream disruption, or formally upgrade the pipeline state now to include body lines and optional metadata.
-- The second biggest open decision is no-key behavior. `AGENTS.md` favors degraded mode, but the clarification recorded
-  in `brainstorming.md` is ambiguous and may imply fail-fast. This must be resolved before implementation.
-- The plan assumes a single-step generation flow, not a multi-pass repair system, because the chosen solution explicitly
-  favored KISS over a heavier architecture.
+- This plan intentionally adapts the external prompt to the actual `shorts-factory` repository. There is no `project.md`
+  or `docs/features/` directory here, so the plan uses repository-local sources instead.
+- The repository currently declares `requires-python = ">=3.10"` in `pyproject.toml`, so implementation steps should
+  respect that baseline unless the project explicitly upgrades later.
+- The current README claims TTS providers are swappable, but the present code is still provider-specific. This refactor
+  is the right place to make that claim truly accurate.
+- The first implementation should avoid introducing heavy forced-alignment dependencies such as WhisperX unless subtitle
+  precision becomes a confirmed requirement.
+- Because `SubtitleTool` and later stages currently consume `audio_path` rather than voice metadata, optional fields
+  should be introduced in a way that does not create unnecessary coupling.
+- The fallback generator currently uses ffmpeg and a temporary file. During implementation, pay special attention to
+  keeping the storage contract and cleanup behavior safe and testable.
+- If public configuration keys are added, the implementation must also update documentation and environment examples as
+  required by `AGENTS.md`.
 
 ---
 
@@ -203,49 +240,47 @@ than shimmed for backward compatibility.
 
 ### Question 1
 
-Should phase 1 keep the public script contract as the current minimal shape (`title`, `hook`, `body`, `cta`, `tags`), or
-should we formally upgrade it now to include `body_lines` and optional metadata fields?
+Which optional `PipelineState` fields do you want implemented in the first pass besides `audio_path`?
 
-Answer: Keep the current minimal public contract for phase 1: `title`, `hook`, `body`, `cta`, and `tags`. This avoids
-immediate downstream churn because `app/chains/state.py`, `tests/test_pipeline.py`, and `app/tools/subtitle_tool.py`
-already depend on `body: str`. If richer structure is useful internally, the dedicated `ScriptGenerator` may use it
-during validation and then map back to the current public payload. Formal `body_lines` and metadata fields should be
-deferred to a later phase.
+Answer: In the first pass, implement `audio_segments`, `voice_provider`, and `voice_id` as optional fields. Those three
+fields are the most useful immediately because they improve observability and future subtitle/video timing integration
+without forcing downstream tools to depend on heavy metadata. `audio_duration_ms` can be added in the same pass only if
+it can be derived reliably without introducing extra complexity or new heavy dependencies.
 
 ### Question 2
 
-For the no-API-key case, should script generation follow the repository’s degraded-mode philosophy with a deterministic
-fallback, or should it fail fast for this specific stage?
+Do you want the first provider abstraction to support only ElevenLabs + silent fallback, or should the initial code
+already include a placeholder local-provider implementation for future expansion?
 
-Answer: Follow the repository’s degraded-mode philosophy and provide a deterministic fallback. `AGENTS.md` explicitly
-requires the pipeline to keep running end-to-end without API keys, so the script stage should not fail fast by default.
-The fallback should generate a predictable, reusable script from the topic with the same public schema, making local
-development and smoke testing reliable.
+Answer: The first provider abstraction should support only ElevenLabs plus the silent fallback provider. That gives the
+project a real abstraction with immediate value while keeping the initial scope small and testable. A placeholder local
+provider is not necessary for v1 because it would add maintenance surface without providing a production benefit yet.
 
 ### Question 3
 
-If English is the default output language, should a non-English topic automatically produce a matching non-English
-script, or should the generator stay English-only unless a language is explicitly provided elsewhere?
+Should segment metadata be persisted to storage as a separate JSON artifact in v1, or kept only in-memory in
+`PipelineState`?
 
-Answer: A non-English topic should automatically produce a matching non-English script. English remains the default when
-the topic is English or language is ambiguous, but the generator should follow the topic language when it is clearly
-non-English. This keeps the interface simple because no new language field is required in `PipelineState` for phase 1.
+Answer: Persist segment metadata as a separate JSON artifact in v1, and also expose the parsed segment metadata in
+`PipelineState` when convenient. Persisting it makes the output reproducible, keeps the artifacts tied to `job_id`, and
+gives downstream tools a stable handoff point without requiring them to regenerate metadata from memory.
 
 ### Question 4
 
-If optional metadata is included, which fields are truly required for phase 1: `estimated_duration_seconds`,
-`pacing_notes`, `visual_cues`, or none of them?
+How aggressive should text normalization be for the first implementation: whitespace and punctuation cleanup only, or
+also light sentence rewriting for speech cadence?
 
-Answer: None of them are required for phase 1. The public pipeline payload should stay minimal, and any metadata
-experimentation should remain optional and internal to the `ScriptGenerator`. If metadata is generated at all during
-phase 1, it should not be required by downstream tools and should not block the core script-generation flow.
+Answer: For the first implementation, normalization should be limited to whitespace cleanup, punctuation cleanup, and
+safe chunk preparation. It should not rewrite sentence meaning or introduce stylistic paraphrasing. That keeps the
+system deterministic, easier to test, and faithful to the validated script generated upstream.
 
 ### Question 5
 
-Do you want the dedicated class to remain inside `app/chains/script_chain.py`, or should the refactor create a new
-module such as `app/chains/script_generator.py` to keep responsibilities separated from the LCEL adapter?
+Should the first implementation prioritize keeping dependencies minimal, even if that means postponing richer audio
+inspection such as accurate duration calculation until a later phase?
 
-Answer: Create a new module such as `app/chains/script_generator.py` for the dedicated class, and keep
-`app/chains/script_chain.py` as a thin LCEL adapter / entry point. This keeps responsibilities clear: the generator
-module owns prompt construction, structured-output invocation, validation, and fallback behavior, while the chain module
-stays focused on exposing the Runnable used by `build_pipeline()`.
+Answer: Yes. The first implementation should prioritize minimal dependencies, even if that means deferring richer audio
+inspection features. If `audio_duration_ms` can be estimated or derived from existing provider metadata or simple
+tooling already available in the stack, it is acceptable to include; otherwise it should be postponed to a later phase
+rather than pulling in heavy audio-processing dependencies too early.
+

@@ -1,36 +1,29 @@
-# Brainstorming — Script Generation Module for Shorts Factory
+# Phase 0 Analysis — Voice Generation (TTS) Module
 
 ## 1. Description of the problem
 
-Shorts Factory needs a first-class **Script Generation** module that turns a user-provided `topic` into a **structured
-short-form video script** that can be consumed by the rest of the pipeline.
-This is the entry point of the current LCEL pipeline:
+The next step to design in **Shorts Factory** is the `VoiceTool`, the second stage of the LCEL pipeline:
 
-```text
-topic → ScriptChain → VoiceTool → VisualTool → VideoAssemblyTool → SubtitleTool → PublishingTool
-```
+`topic → ScriptChain → VoiceTool → VisualTool → VideoAssemblyTool → SubtitleTool → PublishingTool`
 
-The module must produce a stable object that matches the current project contract in `app/chains/state.py`:
+This module consumes the structured script produced by `ScriptChain` and must generate audio that is:
 
-- `title: str`
-- `hook: str`
-- `body: str`
-- `cta: str`
-- `tags: list[str]`
-  The design must stay aligned with the repository conventions from `AGENTS.md`:
-- use **LangChain Runnable / LCEL**
-- keep the component **modular and testable**
-- prefer **simple composition**
-- return **structured data**, not raw prose
-- preserve the future pipeline contract for TTS, visuals, subtitles, and publishing
-- support a **degraded mode** when API keys are missing
-  The main design challenge is to choose the right balance between:
+- natural enough for short-form social video,
+- deterministic enough for automated downstream processing,
+- configurable enough to support different voices and speaking styles,
+- reusable by future steps such as subtitle generation and video assembly,
+- resilient enough to keep the pipeline working in degraded mode when no external API key is available.
 
-1. **speed of implementation**
-2. **schema reliability**
-3. **testability**
-4. **future extensibility**
-5. **compatibility with downstream automation**
+From the current repository state:
+
+- `app/tools/voice_tool.py` already synthesizes one MP3 file and stores it in the configured storage backend;
+- `PipelineState` currently exposes `audio_path` only;
+- the contribution rules in `AGENTS.md` require idempotency when possible, no in-place mutation of state, no direct
+  unmanaged disk I/O, structured logging, and a degraded fallback that still allows the full pipeline to run end-to-end.
+
+The design challenge is therefore not only “generate speech”, but also define a **clean contract** for future growth:
+multiple TTS providers, optional timing metadata, stable storage keys, and compatibility with the existing LangChain
+`Runnable` pipeline.
 
 ---
 
@@ -38,265 +31,277 @@ The module must produce a stable object that matches the current project contrac
 
 ### Repository findings
 
-From the current repository:
+1. `VoiceTool` is currently a single class inheriting from `PipelineTool` and writing `audio_path` back into
+   `PipelineState`.
+2. The current implementation concatenates `hook`, `body`, and `cta` into one text payload, uses ElevenLabs over HTTP
+   when configured, and falls back to ffmpeg-generated silence in development mode.
+3. `PipelineState` does not yet expose timing metadata, voice configuration, or provider metadata.
+4. Project conventions strongly favor:
+    - simple dedicated classes,
+    - lazy initialization,
+    - storage abstraction via `get_storage()`,
+    - degraded-mode fallbacks,
+    - LCEL composition over ad-hoc orchestration.
 
-- `README.md` defines script generation as the first pipeline step and expects a structured script with `title`, `hook`,
-  `body`, `cta`, and `tags`.
-- `app/chains/script_chain.py` currently uses:
-    - `ChatPromptTemplate`
-    - `ChatOpenAI`
-    - `JsonOutputParser`
-    - `RunnableLambda`
-- `app/chains/state.py` defines a lightweight `Script` `TypedDict` and stores the result in `PipelineState["script"]`.
-- `tests/test_pipeline.py` confirms the current downstream expectation: the script is treated as one structured object
-  and `body` is currently a single `str`, not a list of lines.
-- `AGENTS.md` adds an important constraint not yet fully reflected in the current script chain: **the pipeline should
-  still run in degraded mode even without API keys**.
+### External research highlights
 
-### Online research summary
+1. **ElevenLabs TTS docs** expose a `with-timestamps` endpoint that returns generated audio together with precise
+   character-level timing metadata. This is directly relevant for subtitles, scene timing, and future alignment work.
+2. **ElevenLabs best-practices docs** emphasize that delivery quality improves when text is normalized and chunked
+   sensibly, and when punctuation is used intentionally to shape cadence, pauses, and emphasis.
+3. **Coqui TTS** provides an open-source local TTS path that is attractive for privacy, offline development, and future
+   provider independence, but it increases operational complexity and local runtime cost.
+4. **WhisperX** is widely used for word-level timestamps and post-hoc alignment. It is a strong fallback when the chosen
+   TTS provider does not expose alignment metadata or when downstream subtitle quality needs to be normalized across
+   providers.
+5. **ffmpeg `anullsrc`** remains a valid degraded-mode mechanism for generating silence and keeping the pipeline
+   runnable even without cloud credentials.
 
-Brief online research highlights the following useful guidance:
+### Practical implications from the research
 
-1. **LangChain structured output docs** recommend schema-driven structured responses instead of relying only on raw JSON
-   text parsing. The modern pattern is to use `with_structured_output(...)` with a Pydantic model or JSON schema, which
-   improves response reliability and validation.
-2. Current short-form video guidance consistently emphasizes:
-    - a **strong hook in the first 2–3 seconds**
-    - **one core idea per short**
-    - **tight pacing**
-    - a clear **payoff / CTA**
-    - scripts kept concise enough for roughly **15–35 seconds** or around the repo target of **~30 seconds**
-3. For downstream automation, the most important property is not “creative prose quality” alone, but **predictable
-   structure** and **validated content**.
-
-### Key implication
-
-The best design should not stop at “parse some JSON”. It should also:
-
-- validate required fields
-- validate content shape and basic limits
-- make failure modes explicit
-- provide a deterministic fallback when the LLM cannot be used
+- If we want the fastest path to aligned audio, provider-native timestamps are the easiest option.
+- If we want long-term flexibility, we should not couple the entire design to one TTS API response shape.
+- If we want high subtitle quality across providers, post-generation forced alignment is the most robust but also the
+  heaviest solution.
+- The best design should preserve the current simple `VoiceTool` pipeline contract while allowing optional richer
+  outputs later.
 
 ---
 
 ## 3. Thinking process
 
-This module is foundational because it defines the contract for all later stages.
-A good solution should answer these practical questions:
+I evaluated the problem from the perspective of the current repository rather than inventing a separate subsystem.
 
-- How do we guarantee that the script object is always complete?
-- How do we keep the API simple for the rest of the pipeline?
-- How do we remain compatible with LCEL and the existing `build_pipeline()` composition?
-- How do we avoid over-engineering at phase 0?
-- How do we support development without requiring a live LLM key?
-  The current implementation is already close to the target architecture, but it is still minimal:
-- it parses JSON
-- it does not strongly validate the returned structure
-- it is not encapsulated in a dedicated class
-- it does not clearly solve degraded-mode generation
-  So the analysis focuses on three viable directions:
+### Core constraints
 
-1. keep the current shape and improve it incrementally
-2. introduce a dedicated class with schema-driven structured output
-3. introduce a multi-pass generation-and-repair design for maximum robustness
-   The best option should improve correctness without making the first module unnecessarily complex.
+1. The module must fit the existing `PipelineTool` contract.
+2. The pipeline must still run without any API key.
+3. The design should support richer metadata for future subtitle and edit timing needs.
+4. The implementation should stay testable without real provider calls.
+5. The solution should remain easy to extend without turning `VoiceTool` into a large, provider-specific class.
+
+### Main architectural questions
+
+1. Should audio be generated in one pass or segment-by-segment?
+2. Should alignment come from the TTS provider, from a second alignment pass, or be omitted for v1?
+3. Should provider support live inside `VoiceTool` or behind a small provider abstraction?
+4. How much extra metadata should be added to `PipelineState` immediately?
+
+### Design direction
+
+The current codebase is simple and intentionally pragmatic. That suggests avoiding a heavy framework inside the TTS
+stage. At the same time, the project roadmap clearly benefits from a stable voice-generation contract.
+
+That leads to three realistic options:
+
+- a minimal provider-coupled solution,
+- a balanced provider abstraction with segment rendering,
+- a more advanced two-pass render-and-align system.
 
 ---
 
 ## 4. Solutions
 
-### Solution 1 — Minimal LCEL chain with JSON parsing + manual validation
+### Solution 1 — Minimal remote-first `VoiceTool` using ElevenLabs timestamps
 
 #### Description
 
-Keep the current architecture very close to what already exists:
+Keep the architecture close to the current implementation:
 
-- prompt template
-- `ChatOpenAI`
-- `JsonOutputParser`
-- small validation function after parsing
-- `RunnableLambda` adapter to map `PipelineState -> PipelineState`
-  This approach preserves the existing mental model and requires the fewest code changes. A post-parse validator would
-  check:
-- required keys exist
-- strings are non-empty
-- `tags` is a list of lowercase strings
-- title length is acceptable
-- body length stays roughly in target range
-  A fallback function could generate a deterministic template script when no API key is configured.
+- `VoiceTool` remains the only public class for the stage;
+- the tool concatenates the script into one normalized text payload;
+- ElevenLabs stays the primary provider;
+- when configured, the tool calls the provider endpoint that returns both audio and timing metadata;
+- when not configured, the tool falls back to ffmpeg-generated silence;
+- optional metadata such as provider name, voice id, duration estimate, and timestamp file path can be added to the
+  state later.
+
+This is the simplest path and offers immediate value because it leverages provider-native timing support.
 
 #### Example
 
 ```python
-prompt | llm | JsonOutputParser() | validate_script_dict
-```
+state = {
+    "job_id": "job-42",
+    "script": {
+        "title": "Coffee facts",
+        "hook": "Coffee can improve reaction time.",
+        "body": "Caffeine blocks adenosine and helps you feel alert.",
+        "cta": "Follow for more science shorts.",
+        "tags": ["coffee", "science"],
+    },
+}
 
-Example output:
-
-```json
+# Conceptual output
 {
-  "title": "3 octopus facts that feel fake",
-  "hook": "Octopuses have three hearts — and that's just the start.",
-  "body": "They can solve puzzles fast. Their blood is blue. And they can squeeze through tiny gaps because they have no bones.",
-  "cta": "Follow for more weird science facts.",
-  "tags": [
-    "science",
-    "animals",
-    "octopus",
-    "facts",
-    "shorts"
-  ]
+    **state,
+    "audio_path": "storage/job-42/voice.mp3",
+    "voice_provider": "elevenlabs",
+    "voice_timestamps_path": "storage/job-42/voice_alignment.json",
 }
 ```
 
-#### Why it is attractive
+#### Pros
 
-- fastest to implement
-- minimal refactor
-- keeps current LCEL style
-- easy to understand
+- Fastest to implement.
+- Fits the current repository style.
+- Minimal number of moving parts.
+- Timestamps are available without a second pipeline pass.
 
-#### Main limitation
+#### Cons
 
-Validation happens **after** generation, so the LLM is still free to produce malformed output first.
+- Strong coupling to ElevenLabs response semantics.
+- Harder to support multiple providers cleanly.
+- Chunking, normalization, and alignment logic can become tangled inside one class.
+- Less future-proof if the team wants local/offline synthesis.
+
 ---
 
-### Solution 2 — Dedicated `ScriptGenerator` class with schema-driven structured output
+### Solution 2 — Provider abstraction + segment renderer + optional alignment metadata
 
 #### Description
 
-Create a dedicated class responsible for:
+Introduce a small TTS service layer while keeping `VoiceTool` as the pipeline-facing class:
 
-- prompt construction
-- structured-output LLM invocation
-- schema validation
-- fallback generation
-- conversion to the exact `PipelineState` contract
-  The class would encapsulate the script-generation behavior while still exposing a Runnable-compatible entry point for
-  `build_pipeline()`.
-  Core idea:
-- define a Pydantic model or explicit JSON schema for the script
-- ask the LLM for structured output using LangChain’s schema-aware APIs
-- validate content constraints in one place
-- return a plain dict matching the existing `Script` shape
-- if no key is available, build a deterministic fallback script from the topic
-  This matches the prompt instruction to **encapsulate the change within a dedicated class** while keeping LCEL
-  compatibility.
+- `VoiceTool` remains the LangChain stage;
+- it delegates synthesis to a dedicated provider interface such as `TTSProvider`;
+- a `ScriptVoiceRenderer` prepares segments from `hook`, `body`, and `cta`;
+- each segment is synthesized individually or in controlled chunks;
+- the renderer merges audio and emits segment-level metadata;
+- providers can expose native alignment when available, while the common contract stays provider-agnostic;
+- degraded mode still uses a silent or simple generated fallback provider.
+
+This creates a stable architecture without over-engineering the pipeline surface.
 
 #### Example
 
 ```python
-class ScriptGenerator:
-    def build_runnable(self) -> Runnable:
+class TTSProvider(Protocol):
+    def synthesize(self, text: str, voice: VoiceConfig) -> AudioChunk:
         ...
+
+
+class ScriptVoiceRenderer:
+    def render(self, script: Script, provider: TTSProvider) -> RenderedAudio:
+        # hook, body, cta -> segments -> audio + metadata
+        ...
+
+
+class VoiceTool(PipelineTool):
+    name = "VoiceTool"
+
+    def run(self, state: PipelineState) -> PipelineState:
+        rendered = renderer.render(state["script"], provider)
+        return {**state, "audio_path": rendered.audio_path}
 ```
 
-Potential internal flow:
-
-```python
-prompt -> structured_llm -> validated_script_model -> state_adapter
-```
-
-Example output:
+Possible segment metadata:
 
 ```json
-{
-  "title": "Why coffee sharpens your focus",
-  "hook": "Coffee doesn't give you energy the way you think.",
-  "body": "Caffeine blocks the signals that make you feel tired. That means your brain feels more alert fast. But timing matters, or you'll crash later.",
-  "cta": "Subscribe for more fast science explainers.",
-  "tags": [
-    "coffee",
-    "focus",
-    "science",
-    "brain",
-    "shorts"
-  ]
-}
+[
+  {
+    "segment": "hook",
+    "start_ms": 0,
+    "end_ms": 1900
+  },
+  {
+    "segment": "body",
+    "start_ms": 1900,
+    "end_ms": 6400
+  },
+  {
+    "segment": "cta",
+    "start_ms": 6400,
+    "end_ms": 7900
+  }
+]
 ```
 
-#### Why it is attractive
+#### Pros
 
-- strongest balance of structure and simplicity
-- clearer separation of responsibilities
-- easy to test in isolation
-- natural place for fallback behavior
-- future-proof for richer validation or additional fields
+- Best balance between simplicity and extensibility.
+- Makes multiple providers realistic without changing pipeline composition.
+- Keeps `VoiceTool` small and testable.
+- Segment metadata is very useful for visuals, subtitle timing, and analytics.
+- Preserves degraded mode through a dedicated fallback provider.
 
-#### Main limitation
+#### Cons
 
-Slightly more implementation effort than Solution 1.
+- Slightly more design work than a single-class solution.
+- Requires a clear minimal contract for provider outputs.
+- Audio concatenation and metadata merging must be handled carefully.
+
 ---
 
-### Solution 3 — Two-pass generation with validation and repair
+### Solution 3 — Provider-agnostic render first, then forced alignment pass
 
 #### Description
 
-Use a two-step flow:
+Separate speech synthesis from alignment entirely:
 
-1. generate a candidate script
-2. run a second validation/repair pass if the candidate is incomplete, too long, or poorly formatted
-   This can be implemented as:
+1. generate audio with any provider,
+2. run a second alignment step using a tool such as WhisperX,
+3. normalize word/segment timestamps into a provider-independent asset format.
 
-- prompt A: generate draft script
-- parser/schema validation
-- if invalid, prompt B: repair to fit schema and constraints
-  This solution is the most robust against model drift, but it introduces extra complexity, extra latency, and more
-  moving parts at the very first stage of the project.
+This architecture is the strongest if subtitle precision and provider neutrality are the highest priorities.
 
 #### Example
 
 ```python
-draft = draft_chain.invoke({"topic": topic})
-script = repair_chain.invoke({"draft": draft, "errors": validation_errors})
+audio_asset = tts_provider.synthesize(full_text, voice_config)
+alignment = whisperx_align(audio_asset.path, transcript=full_text)
+
+result = {
+    "audio_path": audio_asset.path,
+    "alignment_path": alignment.path,
+    "alignment_source": "whisperx",
+}
 ```
 
-Example behavior:
+#### Pros
 
-- first pass returns 10 tags and a 130-word body
-- validator flags violations
-- repair pass rewrites to 5 tags and a short body
+- Best provider independence.
+- Word-level alignment can be normalized across all providers.
+- Excellent base for subtitles and edit timing.
+- Avoids provider lock-in around metadata formats.
 
-#### Why it is attractive
+#### Cons
 
-- best resilience against malformed outputs
-- explicit handling of bad model responses
-- can improve consistency for production later
+- Highest implementation and operational complexity.
+- Adds heavy runtime dependencies and slower processing.
+- Harder to keep degraded mode lightweight.
+- More moving parts to test and containerize.
 
-#### Main limitation
-
-It is likely too heavy for phase 0 and conflicts with the project’s KISS guidance unless reliability problems are already observed in practice.
 ---
 
 ## 5. Comparison criteria & Summary Table
 
 ### Comparison criteria
 
-The solutions were compared using these criteria:
+I used the following criteria to compare the options:
 
-1. **Implementation complexity**
-2. **Reliability of structured output**
-3. **Fit with current LCEL architecture**
-4. **Ease of isolated testing**
-5. **Support for degraded mode**
-6. **Clarity of ownership / encapsulation**
-7. **Readiness for downstream pipeline stages**
-8. **Risk of over-engineering at this stage**
+1. **Fit with current repository architecture** — does it work naturally with `PipelineTool`, storage abstraction, and
+   `PipelineState`?
+2. **Implementation complexity** — how much code and operational change is required?
+3. **Extensibility** — how easily can we add more providers or richer configuration?
+4. **Alignment quality** — how well does it support subtitles and time-based video assembly?
+5. **Degraded-mode support** — how easily can the pipeline still run without cloud credentials?
+6. **Testing simplicity** — can the behavior be validated with deterministic unit tests?
+7. **Operational footprint** — how expensive is it to run locally and in CI/CD?
 
 ### Summary Table
 
-| Solution                                  | Reliability | Complexity | LCEL fit  | Testability | Degraded mode fit | Future extensibility | Main trade-off                                              |
-|-------------------------------------------|-------------|-----------:|-----------|-------------|-------------------|----------------------|-------------------------------------------------------------|
-| 1. JSON parser + manual validation        | Medium      |        Low | Excellent | Good        | Good              | Medium               | Simple, but validation is reactive rather than schema-first |
-| 2. Dedicated class + schema-driven output | High        |     Medium | Excellent | Excellent   | Excellent         | High                 | Slightly more setup, but best long-term contract            |
-| 3. Two-pass generation + repair           | Very high   |       High | Good      | Medium      | Good              | Very high            | Most robust, but too complex for phase 0                    |
+| Solution                                       | Architecture fit | Complexity | Extensibility |                                           Alignment quality | Degraded mode | Testing | Operational footprint | Summary                                                          |
+|------------------------------------------------|------------------|-----------:|--------------:|------------------------------------------------------------:|--------------:|--------:|----------------------:|------------------------------------------------------------------|
+| **1. Minimal remote-first**                    | Excellent        |        Low |    Medium-Low |               Medium-High if ElevenLabs timestamps are used |          High |    High |                   Low | Best for a fast v1 but tied to one provider                      |
+| **2. Provider abstraction + segment renderer** | Excellent        |     Medium |          High | High at segment level, with optional provider-native timing |          High |    High |                Medium | Best overall balance for this project                            |
+| **3. Render then forced alignment**            | Medium           |       High |     Very High |                                                   Very High |        Medium |  Medium |                  High | Strongest long-term alignment model, but heavy for current stage |
 
 ### Ranked solutions
 
-1. **Solution 2 — Dedicated class + schema-driven output**
-2. **Solution 1 — JSON parser + manual validation**
-3. **Solution 3 — Two-pass generation + repair**
+1. **Solution 2 — Provider abstraction + segment renderer + optional alignment metadata**
+2. **Solution 1 — Minimal remote-first `VoiceTool` using ElevenLabs timestamps**
+3. **Solution 3 — Provider-agnostic render first, then forced alignment pass**
 
 ---
 
@@ -304,58 +309,78 @@ The solutions were compared using these criteria:
 
 ### Selected option
 
-**Solution 2 — Dedicated `ScriptGenerator` class with schema-driven structured output**
+**Solution 2 — Provider abstraction + segment renderer + optional alignment metadata**
 
-### Why this is the best choice
+### Why this is the best fit
 
-This option best matches both the repository and the phase-0 objective:
+This option matches the project’s current architecture and future ambitions better than the alternatives.
 
-- It stays **simple enough** for the first implementation.
-- It respects the instruction to use a **dedicated class**.
-- It still fits naturally into **LCEL** by exposing a Runnable-compatible interface.
-- It offers a **stronger schema contract** than plain JSON parsing.
-- It gives one clean place to implement **fallback logic**, validation, and future enhancements.
-- It protects downstream tools by making the script object more trustworthy.
+It keeps the public pipeline contract simple:
 
-### Recommended design direction
+- the pipeline still uses one `VoiceTool()` stage,
+- the stage still returns enriched `PipelineState`,
+- storage and fallback behavior remain centralized and testable.
 
-The implementation should likely look like this conceptually:
+At the same time, it avoids the biggest long-term weakness of the current implementation: provider-specific logic
+growing directly inside `VoiceTool`.
 
-1. Define a schema model for the script output.
-2. Build a specialized short-form prompt around:
-    - one strong hook
-    - short body
-    - clear CTA
-    - five tags
-3. Invoke the LLM using structured-output support when available.
-4. Validate business constraints in one dedicated place.
-5. Convert the result into the project’s current `Script` dict shape.
-6. If no OpenAI key is available, generate a deterministic fallback script so the pipeline still runs end-to-end.
-7. Wrap the class in a Runnable entry point that enriches `PipelineState` with `script`.
+### Recommended design direction for implementation
 
-### Why not the other options
+When implementation starts, the design should likely evolve toward these responsibilities:
 
-- **Solution 1** is acceptable, but it keeps too much responsibility spread across prompt text, parser behavior, and ad
-  hoc validation.
-- **Solution 3** is attractive for a later production-hardening phase, but it adds too much orchestration for the first
-  module.
+1. **`VoiceTool`**
+    - reads `script` and `job_id` from `PipelineState`,
+    - loads configuration,
+    - selects the provider lazily,
+    - delegates rendering,
+    - writes output paths and optional metadata into a new state dict.
+
+2. **`TTSProvider` contract**
+    - accepts normalized text plus voice settings,
+    - returns audio bytes and optional timing metadata,
+    - allows multiple backends such as ElevenLabs, PlayHT, or Coqui.
+
+3. **`ScriptVoiceRenderer`**
+    - turns structured script into renderable segments,
+    - enforces text normalization and chunking rules,
+    - merges segment outputs into one final asset,
+    - produces segment-level metadata for downstream use.
+
+4. **Fallback provider**
+    - guarantees degraded-mode execution,
+    - produces at minimum a valid audio file,
+    - can later evolve from silence-only to a lightweight local voice if desired.
+
+### Recommended output contract evolution
+
+Keep `audio_path` as the primary required output, then consider adding optional keys such as:
+
+- `audio_metadata_path`
+- `audio_segments`
+- `voice_provider`
+- `voice_id`
+- `audio_duration_ms`
+
+This respects the current pipeline while preparing for subtitles, visual synchronization, and analytics.
 
 ---
 
 ## 7. Notes
 
-- `project.md` is not present in this workspace, so this analysis used `AGENTS.md`, `README.md`,
-  `app/chains/script_chain.py`, `app/chains/state.py`, `app/chains/pipeline.py`, and `tests/test_pipeline.py` as the
-  project brief.
-- The active repository is **Shorts Factory**. The externally referenced prompt path appears to belong to a different
-  project; its process format was useful, but its feature domain does not match this workspace.
-- The current `Script` contract uses `body: str`. If subtitle timing or shot planning becomes important soon, a future
-  revision may benefit from a richer representation such as `body_lines: list[str]` or a scene list, but that is not
-  required for phase 0.
-- A degraded-mode script fallback is important because `AGENTS.md` states that the pipeline should run without external
-  API keys.
-- The module should remain **focused on script generation only** for now. Timing, narration cues, shot breakdowns, and
-  publishing metadata can be layered later without blocking this first step.
+- I treated the in-repository `Shorts Factory` context as authoritative because the attached external prompt path
+  targets a different project domain. I still followed the same phase-0 workflow: analyze, research, compare three
+  solutions, and choose one.
+- The repository currently targets **Python >=3.10** in `pyproject.toml`, even though the phase-0 prompt mentions Python
+  3.11+. Since this phase is analysis-only, the design intentionally stays compatible with the repository’s actual
+  baseline.
+- The current `VoiceTool` already satisfies the degraded-mode philosophy, but it does not yet expose alignment artifacts
+  or provider-neutral abstractions.
+- Segment-level metadata is likely more useful than only a raw full-text timestamp dump because later tools can reason
+  directly about `hook`, `body`, and `cta` boundaries.
+- A full forced-alignment stack is attractive, but it should probably be deferred until subtitle accuracy becomes a
+  demonstrated bottleneck.
+- Implementation should remain idempotent by storing deterministic keys such as `job_id/voice.mp3` and
+  `job_id/voice_alignment.json`.
 
 ---
 
@@ -363,32 +388,51 @@ The implementation should likely look like this conceptually:
 
 ### Question 1
 
-Should the generated script always be in the same language as the input topic, or should the pipeline enforce a default
-language such as French or English?
-Answer: Enforce a default language (English) for now, but allow the prompt to specify that the script should be in the
-same language as the topic if it is not English.
+Should the first implementation of the voice module keep `PipelineState` minimal with only `audio_path`, or should it
+immediately add optional timing metadata fields for subtitles and video timing?
+
+Answer: Keep `audio_path` as the only required field for the first implementation, but add optional timing metadata
+immediately if it can be produced cleanly without complicating the core contract. My recommendation is to add optional
+segment-oriented fields such as `audio_segments` and `audio_duration_ms`, while deferring heavier or more
+provider-specific metadata until a downstream consumer actually requires it.
 
 ### Question 2
 
-Should the `body` remain a single string for now, or do you want the script module to prepare a more structured format
-such as lines or scenes for subtitles and editing later?
-Answer:Script module should prepare a more structured format such as lines for subtitles and editing later.
+Do you want provider selection to be strictly configuration-driven for v1, or should the design already support per-job
+voice/provider overrides inside `PipelineState`?
+
+Answer: For v1, provider selection should be configuration-driven. This keeps the first implementation simpler, easier
+to test, and more consistent with the current repository style. Per-job overrides can be added later, but only once
+there is a concrete product need and a clear `PipelineState` contract for passing voice preferences safely through the
+pipeline.
 
 ### Question 3
 
-Do you want the script generator to include only content text, or should it also prepare optional metadata such as
-estimated duration, pacing notes, or visual cues?
-Answer: It should also prepare optional metadata such as estimated duration, pacing notes, or visual cues, but these can
-be optional fields in the output schema that downstream modules can choose to use or ignore based on their needs.
+Is degraded mode expected to remain silent audio only, or would you prefer a lightweight local spoken fallback once the
+architecture is in place?
+
+Answer: Degraded mode should remain silent audio for the first implementation. It is the lowest-risk fallback, fully
+aligned with the current project conventions, and ensures the pipeline always runs end-to-end. Once the provider
+abstraction is in place, a lightweight spoken local fallback can be introduced later behind the same interface without
+changing the pipeline surface.
 
 ### Question 4
 
-When no LLM API key is configured, should the fallback script be a deterministic template based on the topic, or should
-the module fail fast instead?
-Answer:Should the module faile fast instead
+For downstream consumers, is segment-level timing (`hook`, `body`, `cta`) sufficient, or do you expect word-level
+timestamps from the very first implementation?
+
+Answer: Segment-level timing is sufficient for the first implementation. It maps naturally to the current structured
+script shape (`hook`, `body`, `cta`) and gives downstream tools enough information to improve subtitle placement and
+visual pacing. Word-level timestamps should be treated as a future enhancement when subtitle precision becomes an
+explicit requirement.
 
 ### Question 5
 
-The referenced prompt path points to another repository. Should the local `shorts-factory` analysis prompt be treated as
-the source of truth for future phases?
-Answer: Yes, the local `shorts-factory` analysis prompt should be treated as the source of truth for future phases. 
+Should the voice module normalize and chunk long body text automatically, even if that means the generated audio no
+longer maps one-to-one to the original raw strings?
+
+Answer: Yes, the voice module should normalize and chunk long body text automatically, but it should do so in a
+controlled way that preserves traceability. The renderer should keep a mapping between original script sections and
+rendered chunks so downstream components can still relate timing metadata back to `hook`, `body`, and `cta` even if the
+spoken audio is optimized for cadence and provider limits.
+
