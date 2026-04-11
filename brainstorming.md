@@ -1,549 +1,444 @@
-# Brainstorming — Visual Generation (Visual Agent)
+# Brainstorming - Video Assembly
 
 ## 1. Description of the problem
 
-We need to design the **third step** of the Shorts Factory pipeline: a **Visual Generation** module that converts a
-structured script and optional voice metadata into a sequence of visual assets that can be assembled into a coherent
-YouTube Short.
+Shorts Factory already implements:
 
-In the current repository, the pipeline is:
+- Script Generation
+- Voice Generation
+- Visual Generation
 
-`topic → ScriptChain → VoiceTool → VisualTool → VideoAssemblyTool → SubtitleTool → PublishingTool`
+The next stage to implement is `VideoAssemblyTool`.
 
-The current `VisualTool` is intentionally simple:
+In this repository, the Video Assembly stage must:
 
-- it reads `state["script"]["title"]`
-- queries Pexels for portrait stock videos
-- downloads a few clips locally
-- falls back to a solid-color clip when no API key or results are available
-- returns `image_paths`, even though the values are actually video clip paths
+- read `visual_assets` from `VisualTool`
+- read `audio_path` from `VoiceTool`
+- output a single `video_path` for `SubtitleTool`
+- remain compatible with the `PipelineState` contract in `app/chains/state.py`
+- work offline in degraded mode
+- use `ffmpeg` through `subprocess.run(..., check=True, capture_output=True)`
+- persist the result through `app.services.storage.get_storage()`
+- remain deterministic and idempotent per `job_id`
 
-That keeps the pipeline runnable end-to-end, but it is too limited for a robust visual stage because it:
+Important repo-specific observations:
 
-- ignores `hook`, `body`, `cta`
-- ignores `audio_segments` and `audio_duration_ms` already produced by `VoiceTool`
-- has no explicit asset planning step
-- has no provider abstraction for stock / AI / local libraries
-- has no reusable visual manifest for downstream tools
+- `app/visual/normalizer.py` already outputs assembly-ready clips:
+    - `1080x1920`
+    - `30 fps`
+    - `yuv420p`
+    - `.mp4`
+    - no audio track (`-an`)
+- `app/visual/models.py` already gives the assembly stage timing metadata per asset:
+    - `start_ms`
+    - `end_ms`
+    - `duration_ms`
+- `app/tools/subtitle_tool.py` only needs `video_path`, so subtitle rendering should stay out of Video Assembly.
+- `app/tools/video_tool.py` already contains a basic concat-plus-mux implementation, so the problem is not "invent video
+  assembly from zero", but "choose the right architecture for a production-ready version of the stage".
 
-### Scope used for this analysis
+The core design question is:
 
-There is an ambiguity in the request:
-
-- the active workspace is **`shorts-factory`**
-- the user explicitly referenced an external prompt file under **`project-sma`**, which targets a different MAS/NiceGUI
-  codebase
-- this repository already contains a local prompt at `/.github/prompts/dev-phase-0-analysis.prompt.md` that exactly
-  matches the Shorts Factory Visual Agent problem
-
-For this document, I used the **deliverable format** requested by the external prompt, but grounded the analysis in the
-**actual Shorts Factory repository** (`AGENTS.md`, `README.md`, and the current `app/*` pipeline contracts). This is the
-safest interpretation for the current workspace.
-
----
+How should we assemble already-normalized vertical clips plus narration audio into one deterministic MP4 while keeping
+the implementation simple enough for the current repo, but extensible enough for future timeline features?
 
 ## 2. Research summary
 
-### Repository findings
+Online research was limited to official FFmpeg documentation.
 
-From `AGENTS.md`, `README.md`, and the current code:
+Sources:
 
-- Every stage is a `Runnable[PipelineState, PipelineState]` and must preserve the immutable state pattern:
-  `return {**state, ...}`.
-- `VoiceTool` already produces useful alignment metadata:
-    - `audio_segments_path`
-    - `audio_segments`
-    - `audio_duration_ms`
-- `VideoAssemblyTool` currently expects a local list of clip paths in `image_paths` and concatenates them with ffmpeg
-  before muxing audio.
-- `VisualTool` currently behaves like a thin stock-fetcher, not a real planning/generation agent.
-- The project requires **degraded mode**: the pipeline must still work without external API keys.
-- Files should be persisted through `app.services.storage.get_storage()` and tools should stay idempotent by `job_id`
-  where possible.
+- [FFmpeg Formats Documentation - concat demuxer](https://ffmpeg.org/ffmpeg-formats.html)
+- [FFmpeg Filters Documentation - concat filter](https://ffmpeg.org/ffmpeg-filters.html)
+- [FFmpeg Documentation - -shortest](https://ffmpeg.org/ffmpeg.html)
 
-### External research findings
+Key findings:
 
-Brief web research supports the current design direction:
+- The concat demuxer is a strong fit when files already share the same stream layout, codec family, and time base. The
+  FFmpeg docs explicitly state that it reads a text list of files and that all files must have the same streams, codecs,
+  and timing characteristics.
+- The concat filter is more flexible than the concat demuxer, but it requires more explicit filtergraph management. The
+  FFmpeg docs note that segments must start at timestamp `0`, and corresponding streams must have matching parameters
+  unless explicitly converted.
+- The `-shortest` output option ends encoding when the shortest stream ends. This is useful when muxing narration audio
+  with concatenated visuals, but it is not a complete duration-reconciliation policy by itself.
+- FFmpeg supports more advanced filtergraph-based composition, which is useful when timeline rules become more complex,
+  but this also increases implementation and debugging complexity.
 
-1. **Pexels API**
-    - Search results for the official Pexels API documentation indicate that video search supports filters such as *
-      *orientation**, which matches the repository’s current `orientation=portrait` usage.
-    - This confirms Pexels is a reasonable stock-video source for vertical Shorts workflows.
+What the research means for this repo:
 
-2. **Pixabay API**
-    - Pixabay’s API documentation describes a REST/JSON API for **free images and videos**.
-    - This makes Pixabay a practical secondary provider or fallback provider for a future provider-based architecture.
-
-3. **FFmpeg**
-    - FFmpeg documentation confirms the core primitives already used in the repo are the right ones for assembly:
-        - concat workflows
-        - scaling
-        - cropping
-        - fixed pixel format for broad compatibility
-    - This supports a design where the Visual Agent normalizes assets before assembly, rather than pushing normalization
-      complexity downstream.
-
-### Implications for Shorts Factory
-
-The strongest conclusion is that the next iteration of the visual stage should **not** be “just another stock API
-wrapper”. It should be a **two-part module**:
-
-1. a **planner** that derives shot/asset requests from the script and timing metadata
-2. one or more **providers** that resolve each request into a local asset
-
-That keeps the pipeline modular, testable, and compatible with the project’s LangChain + `PipelineTool` architecture.
-
----
+- Because `VisualNormalizer` already guarantees normalized MP4 clips, Shorts Factory is unusually well-positioned to use
+  the concat demuxer safely.
+- The repo does not yet need a cinematic timeline engine. It needs a reliable assembly step that works with the current
+  visual contract.
+- The best first implementation should take advantage of the strong upstream normalization guarantees instead of
+  rebuilding timeline logic too early.
 
 ## 3. Thinking process
 
-### What the Visual Agent must consume
+### 3.1 Gather and analyze project information
 
-At minimum:
+The assembly stage is not operating on arbitrary media. It receives a constrained, well-shaped manifest:
 
-- `script.title`
-- `script.hook`
-- `script.body`
-- `script.cta`
+- `visual_assets` is already normalized into uniform MP4 clips.
+- `audio_path` already points to the merged narration audio.
+- `audio_duration_ms` may be available and can help with validation.
+- The stage writes exactly one new output into state: `video_path`.
 
-Optionally, and ideally for V1:
+This matters because it narrows the problem significantly.
 
-- `audio_segments`
-- `audio_duration_ms`
+We do not need:
 
-The repository already gives us segment-aware voice metadata, so the cleanest design is to reuse it instead of inventing
-a new timing system.
+- image-to-video rendering in this stage
+- provider selection
+- prompt generation
+- subtitle burn-in
+- YouTube metadata handling
 
-### What the Visual Agent must produce
+We do need:
 
-The output needs to be directly usable by the assembly stage. Conceptually, downstream assembly needs a list of segments
-like:
+- deterministic clip ordering
+- asset existence validation
+- duration sanity checks
+- a local ffmpeg working strategy
+- storage persistence for the final MP4
 
-- local file path
-- asset type (`image` / `video`)
-- intended duration
-- section mapping (`hook` / `body` / `cta`)
-- optional timing (`start_ms`, `end_ms`)
-- optional source metadata (provider, prompt, attribution)
+Potential repo risks discovered during analysis:
 
-The current `image_paths: list[str]` is enough for a smoke test, but not enough for a scalable visual system.
+- `Storage.save()` returns a string path, but if `STORAGE_BACKEND=s3`, downstream ffmpeg commands cannot safely assume
+  the path is a local filesystem path.
+- The current `app/tools/video_tool.py` uses `tempfile.mktemp`, which should be avoided in the hardened implementation.
+- The current tool assumes clip durations are already correct enough to concatenate and then truncates with `-shortest`;
+  that is acceptable for an MVP but not a full design decision.
 
-### Key design constraints from this repository
+### 3.2 Algorithm
 
-Any good solution must:
+The practical algorithm for this repo should be:
 
-- stay inside the `PipelineTool` contract
-- avoid in-place mutation of `PipelineState`
-- keep deterministic fallback behavior when no API keys exist
-- use storage abstraction instead of ad-hoc disk I/O
-- remain easy to test without network access
-- integrate naturally with `VideoAssemblyTool`
-- avoid unnecessary complexity for the current phase
+1. Read `visual_assets` and `audio_path` from state.
+2. Validate that the manifest is non-empty and sorted deterministically.
+3. Validate that every referenced clip exists and is locally accessible to ffmpeg.
+4. Probe or trust the normalized clip durations, then compare the total visual duration against the narration duration.
+5. Build an assembly plan.
+6. Render the concatenated visual stream.
+7. Mux narration audio onto the rendered visual track.
+8. Persist the final MP4 under a deterministic storage key such as `{job_id}/video.mp4`.
+9. Validate the resulting file and return `{**state, "video_path": ...}`.
 
-### Design direction
+The real design choice is how sophisticated step 5 and step 6 should be.
 
-I considered three realistic approaches:
+### 3.3 Architecture direction
 
-1. extend the current `VisualTool` a little, but keep it mostly stock-only
-2. introduce a provider-based visual planner + resolver architecture inside a single dedicated tool
-3. jump directly to a graph-like, multi-stage visual orchestration system
+The public pipeline node should remain `VideoAssemblyTool`, because that matches `AGENTS.md` and the current LCEL
+pipeline.
 
-The second option best matches the project’s current maturity level.
+If the stage grows, the internal complexity should move into private helpers or `app/video/` modules, similar to the way
+the visual stage uses `planner`, `providers`, and `normalizer`.
 
----
+That leads to three realistic options.
 
 ## 4. Solutions
 
-### Solution 1 — Minimal evolution of the current `VisualTool`
+### Solution 1 - Thin monolithic concat demuxer tool
 
 #### Description
 
-Keep one tool class and evolve it incrementally:
+Keep all logic inside `app/tools/video_tool.py`.
 
-- split the script into a few sections (`hook`, `body`, `cta`)
-- generate one search query per section with deterministic rules
-- fetch stock footage for each section from Pexels
-- if no match exists, generate fallback solid-color clips
-- return a flat list of local asset paths for assembly
+Implementation shape:
 
-This is the smallest change from the current implementation.
+- sort assets by `start_ms`, then `chunk_index`
+- write an ffconcat list file
+- run `ffmpeg -f concat -safe 0 -i list.txt -c copy` for the visual stream
+- run a second ffmpeg command to mux the narration audio
+- save the result through `storage.save()`
+
+This is the smallest possible implementation that still matches the current repo contract.
+
+It works well because upstream normalization already guarantees:
+
+- same resolution
+- same fps
+- same pixel format
+- same container family
+- no per-clip audio streams
 
 #### Example
 
 ```python
-state = {
-    "job_id": "job-42",
-    "script": {
-        "title": "Why octopuses are so smart",
-        "hook": "Octopuses solve problems faster than you think.",
-        "body": "They have distributed neurons. Their arms can act semi-independently. That helps them explore and adapt. It is one reason they seem uncannily clever.",
-        "cta": "Follow for more fast science facts.",
-        "tags": ["octopus", "science", "animals", "brain", "shorts"],
-    },
-    "audio_duration_ms": 24000,
-}
-
-# Deterministic search queries
-queries = [
-    "octopus underwater close up",
-    "octopus movement ocean intelligence",
-    "ocean animal cinematic vertical",
-]
-
-# Output shape stays simple
-out = {
-    **state,
-    "image_paths": [
-        "/storage/job-42/clip_0.mp4",
-        "/storage/job-42/clip_1.mp4",
-        "/storage/job-42/clip_2.mp4",
-    ],
-}
-```
-
-#### When it is attractive
-
-- fastest to ship
-- lowest code churn
-- works well if stock footage remains the only supported source
-
-#### Limits
-
-- weak abstraction boundary
-- difficult to add AI generation later
-- timing logic remains shallow
-- downstream metadata remains poor
-
----
-
-### Solution 2 — Provider-based Visual Planner inside a dedicated `VisualTool` (recommended)
-
-#### Description
-
-Create a dedicated visual architecture with **composition**, not a monolith:
-
-- `VisualPlanner`: transforms `script` + optional `audio_segments` into a list of visual segment requests
-- `VisualProvider`: resolves each request using one backend
-    - stock provider (`Pexels`, later `Pixabay`)
-    - AI provider (future)
-    - local-library provider
-    - deterministic fallback provider
-- `VisualNormalizer`: validates / converts assets to vertical, local, assembly-ready files
-- `VisualTool`: orchestrates the planner and providers, persists artifacts, and returns enriched state
-
-This still respects the repository contract because the public pipeline node remains a single `PipelineTool`.
-
-#### Example
-
-```python
-state = {
-    "job_id": "job-42",
-    "script": {
-        "title": "Why octopuses are so smart",
-        "hook": "Octopuses solve problems faster than you think.",
-        "body": "They have distributed neurons. Their arms can act semi-independently. That helps them explore and adapt. It is one reason they seem uncannily clever.",
-        "cta": "Follow for more fast science facts.",
-        "tags": ["octopus", "science", "animals", "brain", "shorts"],
-    },
-    "audio_segments": [
-        {"section": "hook", "chunk_index": 0, "text": "Octopuses solve problems faster than you think.",
-         "duration_ms": 3500},
-        {"section": "body", "chunk_index": 0, "text": "They have distributed neurons.", "duration_ms": 4000},
-        {"section": "body", "chunk_index": 1, "text": "Their arms can act semi-independently.", "duration_ms": 4200},
-        {"section": "cta", "chunk_index": 0, "text": "Follow for more fast science facts.", "duration_ms": 2200},
-    ],
-}
-
-# Planner output (conceptual)
-visual_segments = [
-    {
-        "section": "hook",
-        "prompt": "close-up octopus underwater, dramatic reveal, vertical",
-        "duration_ms": 3500,
-        "provider": "stock",
-    },
-    {
-        "section": "body",
-        "prompt": "octopus moving with tentacles exploring reef, vertical",
-        "duration_ms": 4000,
-        "provider": "stock",
-    },
-    {
-        "section": "cta",
-        "prompt": "clean ocean background for end card, vertical",
-        "duration_ms": 2200,
-        "provider": "fallback",
-    },
-]
-
-# Tool output (conceptual)
-out = {
-    **state,
-    "visual_assets": visual_segments,
-    "image_paths": [
-        "/storage/job-42/visual_0.mp4",
-        "/storage/job-42/visual_1.mp4",
-        "/storage/job-42/visual_2.mp4",
-    ],
-}
-```
-
-#### When it is attractive
-
-- cleanest long-term architecture for this repo
-- directly compatible with future stock + AI + local sources
-- naturally leverages `audio_segments`
-- keeps deterministic degraded mode via a fallback provider
-- easiest to test in isolation by injecting fake providers
-
-#### Limits
-
-- more design work than Solution 1
-- requires a stronger output contract than a raw `list[str]`
-- likely implies later updates to `VideoAssemblyTool`
-
----
-
-### Solution 3 — Graph-like visual orchestration / multi-agent workflow
-
-#### Description
-
-Build the visual stage as a richer workflow with multiple internal nodes, for example:
-
-- prompt generation node
-- provider selection node
-- retrieval / generation node
-- normalization node
-- validation / retry node
-
-This could be implemented with LCEL composition or eventually with LangGraph if branching becomes complex.
-
-The main idea is to optimize for advanced future features from day one:
-
-- retry on poor stock matches
-- mix image and video assets dynamically
-- add ranking / quality scoring
-- human review later
-
-#### Example
-
-```python
-visual_graph = (
-        PromptPlanningNode()
-        | ProviderSelectionNode()
-        | AssetFetchNode()
-        | NormalizeNode()
-        | ValidateNode()
+assets = sorted(
+    state["visual_assets"],
+    key=lambda asset: (asset["start_ms"], asset["chunk_index"]),
 )
 
-# Conceptual behavior
-# 1. derive prompts from hook/body/cta
-# 2. try stock provider
-# 3. retry with fallback provider if no usable asset
-# 4. normalize to 9:16 local clip
-# 5. emit validated visual manifest for assembly
+with NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+    handle.write("ffconcat version 1.0\n")
+    for asset in assets:
+        handle.write(f"file '{asset['path']}'\n")
+    list_path = handle.name
+
+subprocess.run(
+    [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_path,
+        "-c", "copy",
+        concat_path,
+    ],
+    check=True,
+    capture_output=True,
+)
+
+subprocess.run(
+    [
+        "ffmpeg", "-y",
+        "-i", concat_path,
+        "-i", state["audio_path"],
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        out_path,
+    ],
+    check=True,
+    capture_output=True,
+)
 ```
 
-#### When it is attractive
+### Solution 2 - Modular assembler around concat demuxer
 
-- best for very advanced future workflows
-- supports branching, retries, scoring, and later human review
-- aligns with `AGENTS.md` guidance that complex conditional logic can move toward LangGraph
+#### Description
 
-#### Limits
+Keep `VideoAssemblyTool` as the public pipeline step, but move the work into small internal building blocks.
 
-- over-engineered for the current repository state
-- highest implementation complexity
-- hardest to introduce cleanly before the visual contract is stabilized
-- adds mental overhead before the basic provider abstraction exists
+Suggested internal responsibilities:
 
----
+- `AssemblyValidator`: validates state, paths, ordering, and minimum invariants
+- `AssemblyPlan`: stores ordered clips, total visual duration, audio duration, and final output key
+- `FFmpegConcatAssembler`: writes the ffconcat list, renders the visual stream, muxes audio, validates the final file
+- optional `MediaProbe`: centralizes duration probing for audio/video
+
+The rendering backend still uses the concat demuxer, because that is the simplest and most appropriate backend for the
+already-normalized inputs. The difference from Solution 1 is architectural: the stage becomes testable, explainable, and
+ready for future policy decisions.
+
+This approach also gives us one place to define duration policy, for example:
+
+- if drift is tiny, allow `-shortest`
+- if visual total is meaningfully shorter than audio, extend only the last clip
+- if an asset path is non-local, fail fast with a clear message or stage it locally first
+
+#### Example
+
+```python
+class VideoAssemblyTool(PipelineTool):
+    name = "VideoAssemblyTool"
+
+    def run(self, state: PipelineState) -> PipelineState:
+        storage = get_storage()
+        validator = AssemblyValidator()
+        probe = MediaProbe()
+        assembler = FFmpegConcatAssembler(storage=storage, probe=probe)
+
+        plan = validator.build_plan(state, probe=probe)
+        video_path = assembler.render(plan)
+        return {**state, "video_path": video_path}
+```
+
+Possible plan model:
+
+```python
+@dataclass(frozen=True, slots=True)
+class AssemblyPlan:
+    job_id: str
+    audio_path: str
+    clips: list[str]
+    audio_duration_ms: int | None
+    visual_duration_ms: int
+    output_key: str
+```
+
+### Solution 3 - Filtergraph timeline renderer
+
+#### Description
+
+Build a real timeline renderer around `ffmpeg -filter_complex` instead of using the concat demuxer as the primary render
+path.
+
+This approach would:
+
+- open each clip as its own ffmpeg input
+- optionally trim or pad each clip
+- concatenate within a filtergraph
+- optionally support transitions like `xfade`
+- mux audio in the same render pipeline or in a final pass
+
+This is the most flexible design. It becomes attractive if the roadmap soon includes:
+
+- animated transitions
+- overlays
+- text layers
+- background music
+- ducking
+- per-section effects
+
+For the current repo, however, it is the highest-complexity option and asks the implementation to solve problems that
+the upstream visual normalization stage has already solved for us.
+
+#### Example
+
+```bash
+ffmpeg -y \
+  -i clip1.mp4 -i clip2.mp4 -i clip3.mp4 -i voice.mp3 \
+  -filter_complex "\
+    [0:v][1:v][2:v]concat=n=3:v=1:a=0[v]" \
+  -map "[v]" -map 3:a \
+  -c:v libx264 -c:a aac -shortest output.mp4
+```
+
+Or, with future transitions:
+
+```bash
+ffmpeg -y \
+  -i clip1.mp4 -i clip2.mp4 -i voice.mp3 \
+  -filter_complex "\
+    [0:v][1:v]xfade=transition=fade:duration=0.25:offset=2.75[v]" \
+  -map "[v]" -map 2:a \
+  -c:v libx264 -c:a aac output.mp4
+```
 
 ## 5. Comparison criteria & Summary Table
 
 ### Comparison criteria
 
-The solutions were compared using the criteria that matter most for this repository:
-
-1. **Fit with current LCEL pipeline** — how naturally it fits `PipelineTool` + `PipelineState`
-2. **Implementation complexity** — how much design and code it requires now
-3. **Extensibility** — how well it supports future stock / AI / local providers
-4. **Timing alignment quality** — how well it can use `audio_segments` / `audio_duration_ms`
-5. **Degraded mode quality** — how cleanly it supports deterministic fallback without API keys
-6. **Downstream usability** — how useful the output is for `VideoAssemblyTool` and future tools
-7. **Testability** — how easy it is to unit test without network or ffmpeg dependencies everywhere
-8. **Operational clarity** — how easy it is to reason about logs, failures, and artifact persistence
+- Fit with the current repo contracts
+- Implementation complexity
+- Deterministic behavior
+- Offline compatibility
+- Robustness to duration mismatches
+- Testability
+- Future extensibility
+- Operational ffmpeg complexity
 
 ### Summary Table
 
-| Solution                        | Fit with current repo | Complexity | Extensibility | Timing alignment | Degraded mode | Downstream usability | Testability | Overall                        |
-|---------------------------------|-----------------------|------------|---------------|------------------|---------------|----------------------|-------------|--------------------------------|
-| **1. Minimal evolution**        | Excellent             | Low        | Low           | Medium-Low       | Good          | Medium-Low           | Medium      | Good short-term only           |
-| **2. Provider-based planner**   | Excellent             | Medium     | High          | High             | Excellent     | High                 | High        | **Best balance**               |
-| **3. Graph-like orchestration** | Medium                | High       | Very High     | Very High        | High          | Very High            | Medium      | Strong long-term, weak for now |
+| Solution                                   | Fit with current repo | Complexity | Determinism | Extensibility | Main strength                                          | Main weakness                                  |
+|--------------------------------------------|-----------------------|------------|-------------|---------------|--------------------------------------------------------|------------------------------------------------|
+| 1. Thin monolithic concat demuxer tool     | High                  | Low        | High        | Low           | Fastest path to a working stage                        | Logic becomes harder to test and extend        |
+| 2. Modular assembler around concat demuxer | Very high             | Medium     | High        | Medium-high   | Best balance of KISS, testability, and growth          | Slightly more design work up front             |
+| 3. Filtergraph timeline renderer           | Medium                | High       | Medium-high | Very high     | Best long-term flexibility for effects and transitions | Over-engineered for the current input contract |
 
 ### Ranked solutions
 
-1. **Solution 2 — Provider-based Visual Planner inside a dedicated `VisualTool`**
-2. **Solution 1 — Minimal evolution of the current `VisualTool`**
-3. **Solution 3 — Graph-like visual orchestration / multi-agent workflow**
-
-### Key differences
-
-- **Solution 1** optimizes for speed of delivery.
-- **Solution 2** optimizes for clean architecture with practical implementation scope.
-- **Solution 3** optimizes for a future state that the repository is not ready to justify yet.
-
----
+1. Solution 2 - Modular assembler around concat demuxer
+2. Solution 1 - Thin monolithic concat demuxer tool
+3. Solution 3 - Filtergraph timeline renderer
 
 ## 6. Chosen solution
 
-### Chosen approach
+### Recommended choice
 
-**Solution 2 — Provider-based Visual Planner inside a dedicated `VisualTool`**
+Choose **Solution 2 - Modular assembler around concat demuxer**.
 
 ### Why this is the best fit
 
-This solution best respects the existing Shorts Factory architecture while solving the real shortcomings of the current
-visual stage.
+- It respects the repo's current architecture: keep `VideoAssemblyTool` as the single public pipeline node.
+- It uses the strongest fact in the codebase: `VisualNormalizer` already produces concat-friendly clips.
+- It stays close to the current implementation, so implementation risk stays low.
+- It creates explicit seams for unit tests, which the current video stage is missing.
+- It gives a clean place to handle duration policy, path validation, and future staging of remote assets if needed.
+- It does not force the project into a full timeline engine before there is a real product need for one.
 
-It fits because:
+### Recommended implementation shape
 
-- the pipeline still exposes one public node: `VisualTool()`
-- internal complexity is handled through composition, not inheritance-heavy design
-- it can reuse `audio_segments` from `VoiceTool` for alignment
-- it supports multiple providers without turning the tool into a giant conditional block
-- it preserves mandatory degraded mode via a deterministic fallback provider
-- it sets up a better contract for the later `VideoAssemblyTool` and subtitle alignment work
+Public entry point:
 
-### Proposed high-level architecture
+- `app/tools/video_tool.py`
 
-Recommended internal components:
+Suggested internal structure:
 
-- `VisualTool`
-    - public pipeline tool
-    - reads `PipelineState`
-    - invokes the planner
-    - invokes one provider per planned segment
-    - persists assets via storage
-    - returns enriched immutable state
-- `VisualPlanner`
-    - turns `script` and optional voice metadata into a segment plan
-    - uses rule-based planning first
-    - may optionally use LCEL/LLM assistance later for prompt phrasing only
-- `VisualProvider`
-    - interface / protocol for asset resolution
-    - implementations may include:
-        - `PexelsVisualProvider`
-        - `PixabayVisualProvider`
-        - `LocalLibraryVisualProvider`
-        - `FallbackVisualProvider`
-- `VisualNormalizer`
-    - validates that each asset exists
-    - converts assets to consistent local formats and vertical aspect ratio
-    - ensures outputs are directly consumable by ffmpeg assembly
+- keep `VideoAssemblyTool.run()` thin
+- add small private helpers in the same file first, or introduce `app/video/` only if the code becomes large enough to
+  justify it
+- centralize validation and probing before the first ffmpeg command
 
-### Recommended future state contract
+Recommended responsibilities:
 
-For the actual implementation phase, the cleanest contract is to promote visuals to a first-class state field such as:
+- `VideoAssemblyTool`
+    - orchestrates dependencies
+    - reads state
+    - returns `{**state, "video_path": ...}`
+- `build_assembly_plan(...)`
+    - sorts clips
+    - validates manifest fields
+    - determines output key
+    - computes expected total duration
+- `render_concat_video(...)`
+    - writes ffconcat list
+    - renders concatenated visual track
+    - muxes narration audio
+- `probe_duration(...)`
+    - optional wrapper around `ffprobe` or validated ffmpeg metadata extraction
 
-- `visual_assets: list[VisualAsset]`
+### Recommended duration policy
 
-Where each item includes at least:
+For v1:
 
-- `section`
-- `source_type`
-- `provider`
-- `prompt`
-- `path`
-- `duration_ms`
-- `start_ms`
-- `end_ms`
-- `width`
-- `height`
+- treat the normalized clip manifest as the primary visual timeline
+- mux narration audio with `-shortest`
+- add explicit validation and logging when total visual duration and audio duration differ beyond a small tolerance
+- if large drift appears in practice, extend or trim only the last clip rather than redesigning the entire renderer
 
-Then `VideoAssemblyTool` should consume `visual_assets` rather than relying only on `image_paths`.
+### Recommended test plan
 
-### Why not the other options
+Add dedicated `tests/test_video_tool.py` coverage for:
 
-- **Solution 1** would likely have to be redesigned again as soon as a second provider or richer timing model is added.
-- **Solution 3** is architecturally interesting, but too heavy before the base planning/provider contract is stable.
-
----
+- empty `visual_assets` -> raises clear error
+- asset sorting is deterministic
+- local offline assembly succeeds with generated stub clips and silent audio
+- output file is written to deterministic storage location
+- major duration mismatch is surfaced clearly
 
 ## 7. Notes
 
-### Important observations from the current repo
-
-1. `image_paths` is a misleading name for the current visual output because the repo actually stores `.mp4` clips.
-2. `VoiceTool` already provides most of the metadata needed for time-aligned visuals; the visual stage should exploit
-   that instead of ignoring it.
-3. The current `VisualTool` uses only `script["title"]`, which is too weak for visually coherent storytelling.
-4. The project rules strongly favor deterministic fallbacks, so a fallback visual provider is not optional.
-5. The planner should be mostly deterministic in V1; LLM assistance should be optional and limited to prompt refinement,
-   not core control flow.
-
-### Assumptions used in this document
-
-- The immediate task is **analysis only**, not implementation.
-- The actual target repository is **Shorts Factory**, not the unrelated MAS/NiceGUI project described by the external
-  prompt.
-- Future implementation may modernize the visual output contract instead of preserving `image_paths` as the only state
-  field.
-
-### Suggested implementation bias for the next phase
-
-Prefer a **rule-based planner first**, with optional LCEL prompt enrichment later.
-
-That keeps:
-
-- tests stable
-- degraded mode deterministic
-- provider behavior observable
-- implementation complexity under control
-
----
+- The current `app/tools/video_tool.py` is already a usable prototype. The analysis above recommends hardening and
+  structuring it, not discarding it.
+- `VisualTool` already guarantees the most important ffmpeg preconditions, which strongly favors a concat-demuxer-based
+  implementation.
+- `SubtitleTool` consumes `video_path` only, so Video Assembly should stay focused on clip sequencing and audio muxing.
+- `Storage` currently exposes `save()` and `path()` only. If `STORAGE_BACKEND=s3` must be supported during assembly, the
+  repo will likely need a temporary local staging mechanism because ffmpeg cannot safely work on abstract storage URIs
+  as if they were local files.
+- Avoid `tempfile.mktemp` in the implementation. Prefer `TemporaryDirectory` or `NamedTemporaryFile(delete=False)` with
+  explicit cleanup.
+- The prompt file still contains a few older references to earlier stages. This analysis follows the actual repo
+  contract instead of those stale labels.
 
 ## 8. Ask clarification on unclear topic
 
 ### Question 1
 
-The request references the external `project-sma` prompt, but the active workspace and local prompt clearly target
-Shorts Factory. Should future phases continue using the **Shorts Factory interpretation**?
+Should the first implementation of Video Assembly support `STORAGE_BACKEND=s3`, or is local filesystem storage enough
+for the first version?
 
-Answer: only Shorts Factory
+Answer: local filesystem support is enough for v1. If S3 support is required, add explicit download-to-temp
+and upload-from-temp behavior instead of assuming ffmpeg can work directly with storage URIs.
 
 ### Question 2
 
-For V1 of the Visual Agent, should the module support:
+If total visual duration and narration duration do not match, which should be treated as the source of truth?
 
-- stock **video clips only**, or
-- a mix of **video clips + still images + local library assets** from day one?
-
-Answer: a mix of video clips and still images, with a clear provider abstraction to add local library assets later.
+Answer: narration audio should win. Trim or extend only the last visual clip within a small tolerance window
+instead of changing the whole timeline strategy.
 
 ### Question 3
 
-Should timing be derived primarily from `audio_segments`, or is a simpler `hook/body/cta` equal-split approach
-acceptable for the first implementation?
+Do you want transitions in v1, or should the first implementation use straight cuts only?
 
-Answer: primarily from `audio_segments`, since that metadata is already available and provides better alignment. The
-equal-split approach can be a fallback if `audio_segments` is missing or malformed.
+Answer: transitions
 
 ### Question 4
 
-Should the future public state contract replace `image_paths` with a richer `visual_assets` manifest, or should the
-implementation keep `image_paths` as the main output despite its limitations?
+Should Video Assembly remain a single-file implementation for now, or do you want new internal modules such as
+`app/video/assembler.py` and `app/video/probe.py` immediately?
 
-Answer: the future public state contract should replace `image_paths` with a richer `visual_assets` manifest that
-includes metadata for each asset. This provides a more robust and extensible foundation for downstream tools, even if it
-requires updates to `VideoAssemblyTool` later.
-
-### Question 5
-
-Is optional LLM-assisted visual prompt generation acceptable in V1, or should the first implementation remain fully
-deterministic and provider-driven?
-
-Answer: Remaining fully deterministic and provider-driven in V1 is preferable to keep tests stable and behavior
-predictable. LLM-assisted prompt generation can be added in a later iteration once the base architecture is solid.
-
+Answer:immediately
