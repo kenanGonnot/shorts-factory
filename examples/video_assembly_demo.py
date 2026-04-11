@@ -129,7 +129,7 @@ def main() -> None:
     # 5. Report
     video = result["video_path"]
     size_kb = Path(video).stat().st_size / 1024
-    print(f"\n✅  Video assembled successfully!")
+    print("\n✅  Video assembled successfully!")
     print(f"    Path : {video}")
     print(f"    Size : {size_kb:.1f} KB")
     print(f"    Job  : {result['job_id']}")

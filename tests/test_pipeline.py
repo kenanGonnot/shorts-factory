@@ -29,15 +29,31 @@ class StubStep(PipelineTool):
         return {**state, self.key: self.value}
 
 
+class StubSubtitles(PipelineTool):
+    """Stub matching the real ``SubtitleTool`` contract: both keys."""
+
+    name = "StubSubtitles"
+
+    def run(self, state):
+        return {
+            **state,
+            "subtitle_path": "/tmp/subs.srt",
+            "final_path": "/tmp/f.mp4",
+        }
+
+
 def test_pipeline_composes_and_runs():
     pipeline = (
         StubScript()
         | StubStep("voice", "audio_path", "/tmp/a.mp3")
         | StubStep("visual", "visual_assets", [{"path": "/tmp/c.mp4", "section": "hook", "chunk_index": 0, "asset_type": "clip", "provider": "stub", "start_ms": 0, "end_ms": 1000, "duration_ms": 1000, "width": 1080, "height": 1920, "prompt": None, "source_url": None}])
         | StubStep("video", "video_path", "/tmp/v.mp4")
-        | StubStep("subs", "final_path", "/tmp/f.mp4")
+        | StubSubtitles()
         | StubStep("publish", "youtube_id", "yt123")
     )
     out = pipeline.invoke({"job_id": "j1", "topic": "x"})
     assert out["youtube_id"] == "yt123"
     assert out["script"]["title"] == "t"
+    # Subtitle stage must contribute both deterministic artifacts.
+    assert out["subtitle_path"].endswith(".srt")
+    assert out["final_path"].endswith(".mp4")

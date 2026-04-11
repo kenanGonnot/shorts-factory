@@ -1,0 +1,18 @@
+1
+00:00:00,000 --> 00:00:02,000
+Types catch bugs you would never
+see in tests.
+
+2
+00:00:02,000 --> 00:00:03,515
+Static types document intent.
+They help refactors.
+
+3
+00:00:03,515 --> 00:00:05,000
+They also make IDEs much smarter
+about your code.
+
+4
+00:00:05,000 --> 00:00:06,000
+Follow for more Python tips.

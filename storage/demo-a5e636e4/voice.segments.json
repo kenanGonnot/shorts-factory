@@ -1,0 +1,26 @@
+{
+  "job_id": "demo-a5e636e4",
+  "voice_provider": "elevenlabs",
+  "voice_id": "21m00Tcm4TlvDq8ikWAM",
+  "duration_ms": null,
+  "segments": [
+    {
+      "section": "hook",
+      "chunk_index": 0,
+      "text": "Stop scrolling—these 3 facts will change how you see the world.",
+      "duration_ms": null
+    },
+    {
+      "section": "body",
+      "chunk_index": 0,
+      "text": "1) Octopuses have three hearts, and when they swim hard, one heart actually stops. 2) Bananas are berries—straight bananas are “leathery” fruit inside. 3) Honey never truly spoils, because its low water and natural acidity make it hard for microbes to survive. Want more weird science in 30 seconds?",
+      "duration_ms": null
+    },
+    {
+      "section": "cta",
+      "chunk_index": 0,
+      "text": "Follow for more fast, mind-blowing facts!",
+      "duration_ms": null
+    }
+  ]
+}

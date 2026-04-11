@@ -4,37 +4,59 @@ description: 'Analyze and brainstorm multiple solutions for the project describe
 
 # Goal
 
-{{Design the fourth step of an automated YouTube Shorts pipeline: a Video Assembly module using Python and ffmpeg, integrated as a LangChain-compatible tool. The goal is to transform normalized visual assets and a narration audio track into a single vertical short-form video file. The output must be deterministic, synchronized with the audio timeline, and directly reusable by downstream subtitle and publishing components.}}
+{{Design the next step of an automated YouTube Shorts pipeline: a Subtitle Generation module using Python and ffmpeg,
+integrated as a LangChain-compatible tool. The goal is to transform an assembled vertical video plus existing narration
+and timing metadata into a deterministic `.srt` file and a final MP4 with burned-in captions. The output must be
+synchronized with the narration timeline, readable on mobile, and directly reusable by the downstream publishing
+component.}}
 
 ## Thinking Process
 
-{{We are building the fourth component of a larger automated video pipeline. The current problem is to design a clean, extensible, and modular Video Assembly system that combines the outputs of Voice Generation and Visual Generation into a single video artifact. This module must integrate seamlessly with upstream normalized visual assets and narration audio, and prepare a stable output for subtitles and publishing.}}
+{{We are building the next component of a larger automated video pipeline. The current problem is to design a clean,
+extensible, and modular Subtitle Generation system that converts the outputs of Video Assembly and Voice Generation into
+subtitle artifacts for short-form delivery. This module must integrate cleanly with the assembled `video_path`, the
+structured `script`, and available narration timing metadata, while producing stable outputs for publishing in both
+normal and degraded modes.}}
 
 ### 1. Gather and Analyze Project Information
 
-{{Understand that this module consumes `visual_assets` produced by `VisualTool` and `audio_path` produced by `VoiceTool`, with optional timing metadata such as `audio_duration_ms`. It is part of a larger LCEL pipeline, so the design must emphasize modularity, clear input/output contracts, and strict compliance with the `PipelineState` contract from `AGENTS.md`. The system should account for:
-- pre-normalized vertical MP4 clips coming from the visual stage
-- fallback/offline visual assets and silent audio in degraded mode
+{{Understand that this module consumes `video_path` produced by `VideoAssemblyTool` and subtitle text/timing context
+already present in the pipeline state, primarily `script` and, when available, `audio_segments`, `audio_segments_path`,
+and `audio_duration_ms` produced by `VoiceTool`. It is part of a larger LCEL pipeline, so the design must emphasize
+modularity, clear input/output contracts, and strict compliance with the `PipelineState` contract from `AGENTS.md`. The
+system should account for:
+
+- deterministic caption generation from existing narration chunks instead of depending on external transcription
+  services
+- silent-audio / offline degraded mode while still producing a valid `.srt` and burned-in final video
+- mobile-readable subtitle styling for a 1080x1920 vertical video
 - deterministic output storage keyed by `job_id`
 
-The output should be a single assembled video file path (`video_path`) representing the subtitle-ready MP4 generated from sequenced visuals plus muxed narration audio.}}
+The output should be a subtitle file path (`subtitle_path`) and a final burned-in MP4 path (`final_path`) representing
+the publishing-ready video generated from the assembled video plus synchronized captions.}}
 
 ### 2. Algorithm
 
-{{Design a pipeline that takes normalized visual assets and narration audio as input and produces a single assembled video. Steps:
-- Input: `visual_assets` manifest + `audio_path` + optional duration metadata
-- Validate that the referenced assets exist and are usable for assembly
-- Determine sequencing and effective clip durations so the visual timeline matches the narration length
-- Build an ffmpeg assembly strategy (concat/filtergraph) for stitching the clips into one continuous 1080x1920 video
-- Mux the final narration audio onto the assembled visual timeline
-- Export the result to a deterministic storage path for the current `job_id`
-- Validate the resulting MP4 (exists, playable, expected duration, ready for subtitles)
-- Return `video_path` for downstream `SubtitleTool`
-}}
+{{Design a pipeline that takes the assembled video and subtitle text/timing metadata as input and produces subtitle
+artifacts. Steps:
+
+- Input: `video_path` + `script` + optional `audio_segments`, `audio_segments_path`, and `audio_duration_ms`
+- Validate that the referenced video exists and that subtitle timing data is available or can be deterministically
+  reconstructed from the script
+- Convert narration/script content into subtitle cues with start/end timestamps and readable line-breaking/chunking
+  rules
+- Serialize the subtitle cues into an `.srt` file stored at a deterministic path for the current `job_id`
+- Build an ffmpeg burn-in strategy for rendering readable captions onto the vertical video without disturbing the
+  existing audio track
+- Export the final subtitled MP4 to a deterministic storage path for the current `job_id`
+- Validate the resulting `.srt` and MP4 artifacts (exist, playable, duration remains coherent, ready for publishing)
+- Return `subtitle_path` and `final_path` for downstream `PublishingTool`
+  }}
 
 #### Behavioral Rules
 
 {{
+
 - Use clean modular architecture
 - Prefer composition over complex inheritance
 - Use LangChain Runnable / LCEL for prompt generation
@@ -42,17 +64,18 @@ The output should be a single assembled video file path (`video_path`) represent
 - Keep logic simple (KISS)
 - Ensure each component is testable
 - Optimize for future pipeline integration and scalability
-}}
+  }}
 
 ### Notes
 
 {{
+
 - This is the third stage of a larger YouTube Shorts automation pipeline
 - Inputs come from Script (and optionally Voice) modules
 - Output must be directly usable by Video Assembly (ffmpeg)
 - Prefer deterministic behavior with optional LLM assistance for prompts
 - Avoid over-engineering but define a stable contract
-}}
+  }}
 
 ### 3. Architecture
 
@@ -94,7 +117,8 @@ The `brainstorming.md` should contain these sections:
 8. Ask clarification on unclear topic.
     * Ask questions
     * Write "Answer: " under the question and leave it blank for the user to fill in later.
-    * "GPT recommendation: " under the answer section to give your recommendation on the best solution to implement based on the analysis.
+    * "GPT recommendation: " under the answer section to give your recommendation on the best solution to implement
+      based on the analysis.
 
 ### Constraints:
 
