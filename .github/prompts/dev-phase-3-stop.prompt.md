@@ -3,12 +3,12 @@ description: 'Post prompt'
 ---
 # Post-Prompt Instructions
 
-Read `project.md`, `implementation-plan.md`, and all related documentation to understand the current state of the project.
+Read `AGENTS.md`, `implementation-plan.md`, and all related documentation to understand the current state of the project.
 
 ## Post-Prompt Actions
 
-- Update `project.md` and add details that help a developer quickly understand the project.
-- If you detect any numbering issues in `project.md`, correct them.
+- Update `AGENTS.md` and add details that help a developer quickly understand the project.
+- If you detect any numbering issues in `AGENTS.md`, correct them.
 
 ## Wrap-Up Tasks
 

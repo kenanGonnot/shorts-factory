@@ -1,0 +1,26 @@
+{
+  "job_id": "demo",
+  "voice_provider": "elevenlabs",
+  "voice_id": "21m00Tcm4TlvDq8ikWAM",
+  "duration_ms": null,
+  "segments": [
+    {
+      "section": "hook",
+      "chunk_index": 0,
+      "text": "Types catch bugs you would never see in tests!",
+      "duration_ms": null
+    },
+    {
+      "section": "body",
+      "chunk_index": 0,
+      "text": "Static types document intent. They help refactors. They also make IDEs much smarter about your code.",
+      "duration_ms": null
+    },
+    {
+      "section": "cta",
+      "chunk_index": 0,
+      "text": "Follow for more Python tips.",
+      "duration_ms": null
+    }
+  ]
+}

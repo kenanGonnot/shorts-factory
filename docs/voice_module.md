@@ -141,7 +141,7 @@ tool = VoiceTool(
     provider=SilentFallbackProvider(),
     storage=LocalStorage("/tmp/shorts"),
 )
-out = tool.run({"job_id": "demo", "topic": "x", "script": my_script})
+out = tool.run({"job_id": "voice_demo", "topic": "x", "script": my_script})
 ```
 
 A complete runnable example lives at

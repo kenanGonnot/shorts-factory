@@ -1,29 +1,44 @@
-# Phase 0 Analysis — Voice Generation (TTS) Module
+# Brainstorming — Visual Generation (Visual Agent)
 
 ## 1. Description of the problem
 
-The next step to design in **Shorts Factory** is the `VoiceTool`, the second stage of the LCEL pipeline:
+We need to design the **third step** of the Shorts Factory pipeline: a **Visual Generation** module that converts a
+structured script and optional voice metadata into a sequence of visual assets that can be assembled into a coherent
+YouTube Short.
+
+In the current repository, the pipeline is:
 
 `topic → ScriptChain → VoiceTool → VisualTool → VideoAssemblyTool → SubtitleTool → PublishingTool`
 
-This module consumes the structured script produced by `ScriptChain` and must generate audio that is:
+The current `VisualTool` is intentionally simple:
 
-- natural enough for short-form social video,
-- deterministic enough for automated downstream processing,
-- configurable enough to support different voices and speaking styles,
-- reusable by future steps such as subtitle generation and video assembly,
-- resilient enough to keep the pipeline working in degraded mode when no external API key is available.
+- it reads `state["script"]["title"]`
+- queries Pexels for portrait stock videos
+- downloads a few clips locally
+- falls back to a solid-color clip when no API key or results are available
+- returns `image_paths`, even though the values are actually video clip paths
 
-From the current repository state:
+That keeps the pipeline runnable end-to-end, but it is too limited for a robust visual stage because it:
 
-- `app/tools/voice_tool.py` already synthesizes one MP3 file and stores it in the configured storage backend;
-- `PipelineState` currently exposes `audio_path` only;
-- the contribution rules in `AGENTS.md` require idempotency when possible, no in-place mutation of state, no direct
-  unmanaged disk I/O, structured logging, and a degraded fallback that still allows the full pipeline to run end-to-end.
+- ignores `hook`, `body`, `cta`
+- ignores `audio_segments` and `audio_duration_ms` already produced by `VoiceTool`
+- has no explicit asset planning step
+- has no provider abstraction for stock / AI / local libraries
+- has no reusable visual manifest for downstream tools
 
-The design challenge is therefore not only “generate speech”, but also define a **clean contract** for future growth:
-multiple TTS providers, optional timing metadata, stable storage keys, and compatibility with the existing LangChain
-`Runnable` pipeline.
+### Scope used for this analysis
+
+There is an ambiguity in the request:
+
+- the active workspace is **`shorts-factory`**
+- the user explicitly referenced an external prompt file under **`project-sma`**, which targets a different MAS/NiceGUI
+  codebase
+- this repository already contains a local prompt at `/.github/prompts/dev-phase-0-analysis.prompt.md` that exactly
+  matches the Shorts Factory Visual Agent problem
+
+For this document, I used the **deliverable format** requested by the external prompt, but grounded the analysis in the
+**actual Shorts Factory repository** (`AGENTS.md`, `README.md`, and the current `app/*` pipeline contracts). This is the
+safest interpretation for the current workspace.
 
 ---
 
@@ -31,92 +46,127 @@ multiple TTS providers, optional timing metadata, stable storage keys, and compa
 
 ### Repository findings
 
-1. `VoiceTool` is currently a single class inheriting from `PipelineTool` and writing `audio_path` back into
-   `PipelineState`.
-2. The current implementation concatenates `hook`, `body`, and `cta` into one text payload, uses ElevenLabs over HTTP
-   when configured, and falls back to ffmpeg-generated silence in development mode.
-3. `PipelineState` does not yet expose timing metadata, voice configuration, or provider metadata.
-4. Project conventions strongly favor:
-    - simple dedicated classes,
-    - lazy initialization,
-    - storage abstraction via `get_storage()`,
-    - degraded-mode fallbacks,
-    - LCEL composition over ad-hoc orchestration.
+From `AGENTS.md`, `README.md`, and the current code:
 
-### External research highlights
+- Every stage is a `Runnable[PipelineState, PipelineState]` and must preserve the immutable state pattern:
+  `return {**state, ...}`.
+- `VoiceTool` already produces useful alignment metadata:
+    - `audio_segments_path`
+    - `audio_segments`
+    - `audio_duration_ms`
+- `VideoAssemblyTool` currently expects a local list of clip paths in `image_paths` and concatenates them with ffmpeg
+  before muxing audio.
+- `VisualTool` currently behaves like a thin stock-fetcher, not a real planning/generation agent.
+- The project requires **degraded mode**: the pipeline must still work without external API keys.
+- Files should be persisted through `app.services.storage.get_storage()` and tools should stay idempotent by `job_id`
+  where possible.
 
-1. **ElevenLabs TTS docs** expose a `with-timestamps` endpoint that returns generated audio together with precise
-   character-level timing metadata. This is directly relevant for subtitles, scene timing, and future alignment work.
-2. **ElevenLabs best-practices docs** emphasize that delivery quality improves when text is normalized and chunked
-   sensibly, and when punctuation is used intentionally to shape cadence, pauses, and emphasis.
-3. **Coqui TTS** provides an open-source local TTS path that is attractive for privacy, offline development, and future
-   provider independence, but it increases operational complexity and local runtime cost.
-4. **WhisperX** is widely used for word-level timestamps and post-hoc alignment. It is a strong fallback when the chosen
-   TTS provider does not expose alignment metadata or when downstream subtitle quality needs to be normalized across
-   providers.
-5. **ffmpeg `anullsrc`** remains a valid degraded-mode mechanism for generating silence and keeping the pipeline
-   runnable even without cloud credentials.
+### External research findings
 
-### Practical implications from the research
+Brief web research supports the current design direction:
 
-- If we want the fastest path to aligned audio, provider-native timestamps are the easiest option.
-- If we want long-term flexibility, we should not couple the entire design to one TTS API response shape.
-- If we want high subtitle quality across providers, post-generation forced alignment is the most robust but also the
-  heaviest solution.
-- The best design should preserve the current simple `VoiceTool` pipeline contract while allowing optional richer
-  outputs later.
+1. **Pexels API**
+    - Search results for the official Pexels API documentation indicate that video search supports filters such as *
+      *orientation**, which matches the repository’s current `orientation=portrait` usage.
+    - This confirms Pexels is a reasonable stock-video source for vertical Shorts workflows.
+
+2. **Pixabay API**
+    - Pixabay’s API documentation describes a REST/JSON API for **free images and videos**.
+    - This makes Pixabay a practical secondary provider or fallback provider for a future provider-based architecture.
+
+3. **FFmpeg**
+    - FFmpeg documentation confirms the core primitives already used in the repo are the right ones for assembly:
+        - concat workflows
+        - scaling
+        - cropping
+        - fixed pixel format for broad compatibility
+    - This supports a design where the Visual Agent normalizes assets before assembly, rather than pushing normalization
+      complexity downstream.
+
+### Implications for Shorts Factory
+
+The strongest conclusion is that the next iteration of the visual stage should **not** be “just another stock API
+wrapper”. It should be a **two-part module**:
+
+1. a **planner** that derives shot/asset requests from the script and timing metadata
+2. one or more **providers** that resolve each request into a local asset
+
+That keeps the pipeline modular, testable, and compatible with the project’s LangChain + `PipelineTool` architecture.
 
 ---
 
 ## 3. Thinking process
 
-I evaluated the problem from the perspective of the current repository rather than inventing a separate subsystem.
+### What the Visual Agent must consume
 
-### Core constraints
+At minimum:
 
-1. The module must fit the existing `PipelineTool` contract.
-2. The pipeline must still run without any API key.
-3. The design should support richer metadata for future subtitle and edit timing needs.
-4. The implementation should stay testable without real provider calls.
-5. The solution should remain easy to extend without turning `VoiceTool` into a large, provider-specific class.
+- `script.title`
+- `script.hook`
+- `script.body`
+- `script.cta`
 
-### Main architectural questions
+Optionally, and ideally for V1:
 
-1. Should audio be generated in one pass or segment-by-segment?
-2. Should alignment come from the TTS provider, from a second alignment pass, or be omitted for v1?
-3. Should provider support live inside `VoiceTool` or behind a small provider abstraction?
-4. How much extra metadata should be added to `PipelineState` immediately?
+- `audio_segments`
+- `audio_duration_ms`
+
+The repository already gives us segment-aware voice metadata, so the cleanest design is to reuse it instead of inventing
+a new timing system.
+
+### What the Visual Agent must produce
+
+The output needs to be directly usable by the assembly stage. Conceptually, downstream assembly needs a list of segments
+like:
+
+- local file path
+- asset type (`image` / `video`)
+- intended duration
+- section mapping (`hook` / `body` / `cta`)
+- optional timing (`start_ms`, `end_ms`)
+- optional source metadata (provider, prompt, attribution)
+
+The current `image_paths: list[str]` is enough for a smoke test, but not enough for a scalable visual system.
+
+### Key design constraints from this repository
+
+Any good solution must:
+
+- stay inside the `PipelineTool` contract
+- avoid in-place mutation of `PipelineState`
+- keep deterministic fallback behavior when no API keys exist
+- use storage abstraction instead of ad-hoc disk I/O
+- remain easy to test without network access
+- integrate naturally with `VideoAssemblyTool`
+- avoid unnecessary complexity for the current phase
 
 ### Design direction
 
-The current codebase is simple and intentionally pragmatic. That suggests avoiding a heavy framework inside the TTS
-stage. At the same time, the project roadmap clearly benefits from a stable voice-generation contract.
+I considered three realistic approaches:
 
-That leads to three realistic options:
+1. extend the current `VisualTool` a little, but keep it mostly stock-only
+2. introduce a provider-based visual planner + resolver architecture inside a single dedicated tool
+3. jump directly to a graph-like, multi-stage visual orchestration system
 
-- a minimal provider-coupled solution,
-- a balanced provider abstraction with segment rendering,
-- a more advanced two-pass render-and-align system.
+The second option best matches the project’s current maturity level.
 
 ---
 
 ## 4. Solutions
 
-### Solution 1 — Minimal remote-first `VoiceTool` using ElevenLabs timestamps
+### Solution 1 — Minimal evolution of the current `VisualTool`
 
 #### Description
 
-Keep the architecture close to the current implementation:
+Keep one tool class and evolve it incrementally:
 
-- `VoiceTool` remains the only public class for the stage;
-- the tool concatenates the script into one normalized text payload;
-- ElevenLabs stays the primary provider;
-- when configured, the tool calls the provider endpoint that returns both audio and timing metadata;
-- when not configured, the tool falls back to ffmpeg-generated silence;
-- optional metadata such as provider name, voice id, duration estimate, and timestamp file path can be added to the
-  state later.
+- split the script into a few sections (`hook`, `body`, `cta`)
+- generate one search query per section with deterministic rules
+- fetch stock footage for each section from Pexels
+- if no match exists, generate fallback solid-color clips
+- return a flat list of local asset paths for assembly
 
-This is the simplest path and offers immediate value because it leverages provider-native timing support.
+This is the smallest change from the current implementation.
 
 #### Example
 
@@ -124,153 +174,188 @@ This is the simplest path and offers immediate value because it leverages provid
 state = {
     "job_id": "job-42",
     "script": {
-        "title": "Coffee facts",
-        "hook": "Coffee can improve reaction time.",
-        "body": "Caffeine blocks adenosine and helps you feel alert.",
-        "cta": "Follow for more science shorts.",
-        "tags": ["coffee", "science"],
+        "title": "Why octopuses are so smart",
+        "hook": "Octopuses solve problems faster than you think.",
+        "body": "They have distributed neurons. Their arms can act semi-independently. That helps them explore and adapt. It is one reason they seem uncannily clever.",
+        "cta": "Follow for more fast science facts.",
+        "tags": ["octopus", "science", "animals", "brain", "shorts"],
     },
+    "audio_duration_ms": 24000,
 }
 
-# Conceptual output
-{
-    **state,
-    "audio_path": "storage/job-42/voice.mp3",
-    "voice_provider": "elevenlabs",
-    "voice_timestamps_path": "storage/job-42/voice_alignment.json",
-}
-```
-
-#### Pros
-
-- Fastest to implement.
-- Fits the current repository style.
-- Minimal number of moving parts.
-- Timestamps are available without a second pipeline pass.
-
-#### Cons
-
-- Strong coupling to ElevenLabs response semantics.
-- Harder to support multiple providers cleanly.
-- Chunking, normalization, and alignment logic can become tangled inside one class.
-- Less future-proof if the team wants local/offline synthesis.
-
----
-
-### Solution 2 — Provider abstraction + segment renderer + optional alignment metadata
-
-#### Description
-
-Introduce a small TTS service layer while keeping `VoiceTool` as the pipeline-facing class:
-
-- `VoiceTool` remains the LangChain stage;
-- it delegates synthesis to a dedicated provider interface such as `TTSProvider`;
-- a `ScriptVoiceRenderer` prepares segments from `hook`, `body`, and `cta`;
-- each segment is synthesized individually or in controlled chunks;
-- the renderer merges audio and emits segment-level metadata;
-- providers can expose native alignment when available, while the common contract stays provider-agnostic;
-- degraded mode still uses a silent or simple generated fallback provider.
-
-This creates a stable architecture without over-engineering the pipeline surface.
-
-#### Example
-
-```python
-class TTSProvider(Protocol):
-    def synthesize(self, text: str, voice: VoiceConfig) -> AudioChunk:
-        ...
-
-
-class ScriptVoiceRenderer:
-    def render(self, script: Script, provider: TTSProvider) -> RenderedAudio:
-        # hook, body, cta -> segments -> audio + metadata
-        ...
-
-
-class VoiceTool(PipelineTool):
-    name = "VoiceTool"
-
-    def run(self, state: PipelineState) -> PipelineState:
-        rendered = renderer.render(state["script"], provider)
-        return {**state, "audio_path": rendered.audio_path}
-```
-
-Possible segment metadata:
-
-```json
-[
-  {
-    "segment": "hook",
-    "start_ms": 0,
-    "end_ms": 1900
-  },
-  {
-    "segment": "body",
-    "start_ms": 1900,
-    "end_ms": 6400
-  },
-  {
-    "segment": "cta",
-    "start_ms": 6400,
-    "end_ms": 7900
-  }
+# Deterministic search queries
+queries = [
+    "octopus underwater close up",
+    "octopus movement ocean intelligence",
+    "ocean animal cinematic vertical",
 ]
+
+# Output shape stays simple
+out = {
+    **state,
+    "image_paths": [
+        "/storage/job-42/clip_0.mp4",
+        "/storage/job-42/clip_1.mp4",
+        "/storage/job-42/clip_2.mp4",
+    ],
+}
 ```
 
-#### Pros
+#### When it is attractive
 
-- Best balance between simplicity and extensibility.
-- Makes multiple providers realistic without changing pipeline composition.
-- Keeps `VoiceTool` small and testable.
-- Segment metadata is very useful for visuals, subtitle timing, and analytics.
-- Preserves degraded mode through a dedicated fallback provider.
+- fastest to ship
+- lowest code churn
+- works well if stock footage remains the only supported source
 
-#### Cons
+#### Limits
 
-- Slightly more design work than a single-class solution.
-- Requires a clear minimal contract for provider outputs.
-- Audio concatenation and metadata merging must be handled carefully.
+- weak abstraction boundary
+- difficult to add AI generation later
+- timing logic remains shallow
+- downstream metadata remains poor
 
 ---
 
-### Solution 3 — Provider-agnostic render first, then forced alignment pass
+### Solution 2 — Provider-based Visual Planner inside a dedicated `VisualTool` (recommended)
 
 #### Description
 
-Separate speech synthesis from alignment entirely:
+Create a dedicated visual architecture with **composition**, not a monolith:
 
-1. generate audio with any provider,
-2. run a second alignment step using a tool such as WhisperX,
-3. normalize word/segment timestamps into a provider-independent asset format.
+- `VisualPlanner`: transforms `script` + optional `audio_segments` into a list of visual segment requests
+- `VisualProvider`: resolves each request using one backend
+    - stock provider (`Pexels`, later `Pixabay`)
+    - AI provider (future)
+    - local-library provider
+    - deterministic fallback provider
+- `VisualNormalizer`: validates / converts assets to vertical, local, assembly-ready files
+- `VisualTool`: orchestrates the planner and providers, persists artifacts, and returns enriched state
 
-This architecture is the strongest if subtitle precision and provider neutrality are the highest priorities.
+This still respects the repository contract because the public pipeline node remains a single `PipelineTool`.
 
 #### Example
 
 ```python
-audio_asset = tts_provider.synthesize(full_text, voice_config)
-alignment = whisperx_align(audio_asset.path, transcript=full_text)
+state = {
+    "job_id": "job-42",
+    "script": {
+        "title": "Why octopuses are so smart",
+        "hook": "Octopuses solve problems faster than you think.",
+        "body": "They have distributed neurons. Their arms can act semi-independently. That helps them explore and adapt. It is one reason they seem uncannily clever.",
+        "cta": "Follow for more fast science facts.",
+        "tags": ["octopus", "science", "animals", "brain", "shorts"],
+    },
+    "audio_segments": [
+        {"section": "hook", "chunk_index": 0, "text": "Octopuses solve problems faster than you think.",
+         "duration_ms": 3500},
+        {"section": "body", "chunk_index": 0, "text": "They have distributed neurons.", "duration_ms": 4000},
+        {"section": "body", "chunk_index": 1, "text": "Their arms can act semi-independently.", "duration_ms": 4200},
+        {"section": "cta", "chunk_index": 0, "text": "Follow for more fast science facts.", "duration_ms": 2200},
+    ],
+}
 
-result = {
-    "audio_path": audio_asset.path,
-    "alignment_path": alignment.path,
-    "alignment_source": "whisperx",
+# Planner output (conceptual)
+visual_segments = [
+    {
+        "section": "hook",
+        "prompt": "close-up octopus underwater, dramatic reveal, vertical",
+        "duration_ms": 3500,
+        "provider": "stock",
+    },
+    {
+        "section": "body",
+        "prompt": "octopus moving with tentacles exploring reef, vertical",
+        "duration_ms": 4000,
+        "provider": "stock",
+    },
+    {
+        "section": "cta",
+        "prompt": "clean ocean background for end card, vertical",
+        "duration_ms": 2200,
+        "provider": "fallback",
+    },
+]
+
+# Tool output (conceptual)
+out = {
+    **state,
+    "visual_assets": visual_segments,
+    "image_paths": [
+        "/storage/job-42/visual_0.mp4",
+        "/storage/job-42/visual_1.mp4",
+        "/storage/job-42/visual_2.mp4",
+    ],
 }
 ```
 
-#### Pros
+#### When it is attractive
 
-- Best provider independence.
-- Word-level alignment can be normalized across all providers.
-- Excellent base for subtitles and edit timing.
-- Avoids provider lock-in around metadata formats.
+- cleanest long-term architecture for this repo
+- directly compatible with future stock + AI + local sources
+- naturally leverages `audio_segments`
+- keeps deterministic degraded mode via a fallback provider
+- easiest to test in isolation by injecting fake providers
 
-#### Cons
+#### Limits
 
-- Highest implementation and operational complexity.
-- Adds heavy runtime dependencies and slower processing.
-- Harder to keep degraded mode lightweight.
-- More moving parts to test and containerize.
+- more design work than Solution 1
+- requires a stronger output contract than a raw `list[str]`
+- likely implies later updates to `VideoAssemblyTool`
+
+---
+
+### Solution 3 — Graph-like visual orchestration / multi-agent workflow
+
+#### Description
+
+Build the visual stage as a richer workflow with multiple internal nodes, for example:
+
+- prompt generation node
+- provider selection node
+- retrieval / generation node
+- normalization node
+- validation / retry node
+
+This could be implemented with LCEL composition or eventually with LangGraph if branching becomes complex.
+
+The main idea is to optimize for advanced future features from day one:
+
+- retry on poor stock matches
+- mix image and video assets dynamically
+- add ranking / quality scoring
+- human review later
+
+#### Example
+
+```python
+visual_graph = (
+        PromptPlanningNode()
+        | ProviderSelectionNode()
+        | AssetFetchNode()
+        | NormalizeNode()
+        | ValidateNode()
+)
+
+# Conceptual behavior
+# 1. derive prompts from hook/body/cta
+# 2. try stock provider
+# 3. retry with fallback provider if no usable asset
+# 4. normalize to 9:16 local clip
+# 5. emit validated visual manifest for assembly
+```
+
+#### When it is attractive
+
+- best for very advanced future workflows
+- supports branching, retries, scoring, and later human review
+- aligns with `AGENTS.md` guidance that complex conditional logic can move toward LangGraph
+
+#### Limits
+
+- over-engineered for the current repository state
+- highest implementation complexity
+- hardest to introduce cleanly before the visual contract is stabilized
+- adds mental overhead before the basic provider abstraction exists
 
 ---
 
@@ -278,109 +363,144 @@ result = {
 
 ### Comparison criteria
 
-I used the following criteria to compare the options:
+The solutions were compared using the criteria that matter most for this repository:
 
-1. **Fit with current repository architecture** — does it work naturally with `PipelineTool`, storage abstraction, and
-   `PipelineState`?
-2. **Implementation complexity** — how much code and operational change is required?
-3. **Extensibility** — how easily can we add more providers or richer configuration?
-4. **Alignment quality** — how well does it support subtitles and time-based video assembly?
-5. **Degraded-mode support** — how easily can the pipeline still run without cloud credentials?
-6. **Testing simplicity** — can the behavior be validated with deterministic unit tests?
-7. **Operational footprint** — how expensive is it to run locally and in CI/CD?
+1. **Fit with current LCEL pipeline** — how naturally it fits `PipelineTool` + `PipelineState`
+2. **Implementation complexity** — how much design and code it requires now
+3. **Extensibility** — how well it supports future stock / AI / local providers
+4. **Timing alignment quality** — how well it can use `audio_segments` / `audio_duration_ms`
+5. **Degraded mode quality** — how cleanly it supports deterministic fallback without API keys
+6. **Downstream usability** — how useful the output is for `VideoAssemblyTool` and future tools
+7. **Testability** — how easy it is to unit test without network or ffmpeg dependencies everywhere
+8. **Operational clarity** — how easy it is to reason about logs, failures, and artifact persistence
 
 ### Summary Table
 
-| Solution                                       | Architecture fit | Complexity | Extensibility |                                           Alignment quality | Degraded mode | Testing | Operational footprint | Summary                                                          |
-|------------------------------------------------|------------------|-----------:|--------------:|------------------------------------------------------------:|--------------:|--------:|----------------------:|------------------------------------------------------------------|
-| **1. Minimal remote-first**                    | Excellent        |        Low |    Medium-Low |               Medium-High if ElevenLabs timestamps are used |          High |    High |                   Low | Best for a fast v1 but tied to one provider                      |
-| **2. Provider abstraction + segment renderer** | Excellent        |     Medium |          High | High at segment level, with optional provider-native timing |          High |    High |                Medium | Best overall balance for this project                            |
-| **3. Render then forced alignment**            | Medium           |       High |     Very High |                                                   Very High |        Medium |  Medium |                  High | Strongest long-term alignment model, but heavy for current stage |
+| Solution                        | Fit with current repo | Complexity | Extensibility | Timing alignment | Degraded mode | Downstream usability | Testability | Overall                        |
+|---------------------------------|-----------------------|------------|---------------|------------------|---------------|----------------------|-------------|--------------------------------|
+| **1. Minimal evolution**        | Excellent             | Low        | Low           | Medium-Low       | Good          | Medium-Low           | Medium      | Good short-term only           |
+| **2. Provider-based planner**   | Excellent             | Medium     | High          | High             | Excellent     | High                 | High        | **Best balance**               |
+| **3. Graph-like orchestration** | Medium                | High       | Very High     | Very High        | High          | Very High            | Medium      | Strong long-term, weak for now |
 
 ### Ranked solutions
 
-1. **Solution 2 — Provider abstraction + segment renderer + optional alignment metadata**
-2. **Solution 1 — Minimal remote-first `VoiceTool` using ElevenLabs timestamps**
-3. **Solution 3 — Provider-agnostic render first, then forced alignment pass**
+1. **Solution 2 — Provider-based Visual Planner inside a dedicated `VisualTool`**
+2. **Solution 1 — Minimal evolution of the current `VisualTool`**
+3. **Solution 3 — Graph-like visual orchestration / multi-agent workflow**
+
+### Key differences
+
+- **Solution 1** optimizes for speed of delivery.
+- **Solution 2** optimizes for clean architecture with practical implementation scope.
+- **Solution 3** optimizes for a future state that the repository is not ready to justify yet.
 
 ---
 
-## 6. Choosen solution
+## 6. Chosen solution
 
-### Selected option
+### Chosen approach
 
-**Solution 2 — Provider abstraction + segment renderer + optional alignment metadata**
+**Solution 2 — Provider-based Visual Planner inside a dedicated `VisualTool`**
 
 ### Why this is the best fit
 
-This option matches the project’s current architecture and future ambitions better than the alternatives.
+This solution best respects the existing Shorts Factory architecture while solving the real shortcomings of the current
+visual stage.
 
-It keeps the public pipeline contract simple:
+It fits because:
 
-- the pipeline still uses one `VoiceTool()` stage,
-- the stage still returns enriched `PipelineState`,
-- storage and fallback behavior remain centralized and testable.
+- the pipeline still exposes one public node: `VisualTool()`
+- internal complexity is handled through composition, not inheritance-heavy design
+- it can reuse `audio_segments` from `VoiceTool` for alignment
+- it supports multiple providers without turning the tool into a giant conditional block
+- it preserves mandatory degraded mode via a deterministic fallback provider
+- it sets up a better contract for the later `VideoAssemblyTool` and subtitle alignment work
 
-At the same time, it avoids the biggest long-term weakness of the current implementation: provider-specific logic
-growing directly inside `VoiceTool`.
+### Proposed high-level architecture
 
-### Recommended design direction for implementation
+Recommended internal components:
 
-When implementation starts, the design should likely evolve toward these responsibilities:
+- `VisualTool`
+    - public pipeline tool
+    - reads `PipelineState`
+    - invokes the planner
+    - invokes one provider per planned segment
+    - persists assets via storage
+    - returns enriched immutable state
+- `VisualPlanner`
+    - turns `script` and optional voice metadata into a segment plan
+    - uses rule-based planning first
+    - may optionally use LCEL/LLM assistance later for prompt phrasing only
+- `VisualProvider`
+    - interface / protocol for asset resolution
+    - implementations may include:
+        - `PexelsVisualProvider`
+        - `PixabayVisualProvider`
+        - `LocalLibraryVisualProvider`
+        - `FallbackVisualProvider`
+- `VisualNormalizer`
+    - validates that each asset exists
+    - converts assets to consistent local formats and vertical aspect ratio
+    - ensures outputs are directly consumable by ffmpeg assembly
 
-1. **`VoiceTool`**
-    - reads `script` and `job_id` from `PipelineState`,
-    - loads configuration,
-    - selects the provider lazily,
-    - delegates rendering,
-    - writes output paths and optional metadata into a new state dict.
+### Recommended future state contract
 
-2. **`TTSProvider` contract**
-    - accepts normalized text plus voice settings,
-    - returns audio bytes and optional timing metadata,
-    - allows multiple backends such as ElevenLabs, PlayHT, or Coqui.
+For the actual implementation phase, the cleanest contract is to promote visuals to a first-class state field such as:
 
-3. **`ScriptVoiceRenderer`**
-    - turns structured script into renderable segments,
-    - enforces text normalization and chunking rules,
-    - merges segment outputs into one final asset,
-    - produces segment-level metadata for downstream use.
+- `visual_assets: list[VisualAsset]`
 
-4. **Fallback provider**
-    - guarantees degraded-mode execution,
-    - produces at minimum a valid audio file,
-    - can later evolve from silence-only to a lightweight local voice if desired.
+Where each item includes at least:
 
-### Recommended output contract evolution
+- `section`
+- `source_type`
+- `provider`
+- `prompt`
+- `path`
+- `duration_ms`
+- `start_ms`
+- `end_ms`
+- `width`
+- `height`
 
-Keep `audio_path` as the primary required output, then consider adding optional keys such as:
+Then `VideoAssemblyTool` should consume `visual_assets` rather than relying only on `image_paths`.
 
-- `audio_metadata_path`
-- `audio_segments`
-- `voice_provider`
-- `voice_id`
-- `audio_duration_ms`
+### Why not the other options
 
-This respects the current pipeline while preparing for subtitles, visual synchronization, and analytics.
+- **Solution 1** would likely have to be redesigned again as soon as a second provider or richer timing model is added.
+- **Solution 3** is architecturally interesting, but too heavy before the base planning/provider contract is stable.
 
 ---
 
 ## 7. Notes
 
-- I treated the in-repository `Shorts Factory` context as authoritative because the attached external prompt path
-  targets a different project domain. I still followed the same phase-0 workflow: analyze, research, compare three
-  solutions, and choose one.
-- The repository currently targets **Python >=3.10** in `pyproject.toml`, even though the phase-0 prompt mentions Python
-  3.11+. Since this phase is analysis-only, the design intentionally stays compatible with the repository’s actual
-  baseline.
-- The current `VoiceTool` already satisfies the degraded-mode philosophy, but it does not yet expose alignment artifacts
-  or provider-neutral abstractions.
-- Segment-level metadata is likely more useful than only a raw full-text timestamp dump because later tools can reason
-  directly about `hook`, `body`, and `cta` boundaries.
-- A full forced-alignment stack is attractive, but it should probably be deferred until subtitle accuracy becomes a
-  demonstrated bottleneck.
-- Implementation should remain idempotent by storing deterministic keys such as `job_id/voice.mp3` and
-  `job_id/voice_alignment.json`.
+### Important observations from the current repo
+
+1. `image_paths` is a misleading name for the current visual output because the repo actually stores `.mp4` clips.
+2. `VoiceTool` already provides most of the metadata needed for time-aligned visuals; the visual stage should exploit
+   that instead of ignoring it.
+3. The current `VisualTool` uses only `script["title"]`, which is too weak for visually coherent storytelling.
+4. The project rules strongly favor deterministic fallbacks, so a fallback visual provider is not optional.
+5. The planner should be mostly deterministic in V1; LLM assistance should be optional and limited to prompt refinement,
+   not core control flow.
+
+### Assumptions used in this document
+
+- The immediate task is **analysis only**, not implementation.
+- The actual target repository is **Shorts Factory**, not the unrelated MAS/NiceGUI project described by the external
+  prompt.
+- Future implementation may modernize the visual output contract instead of preserving `image_paths` as the only state
+  field.
+
+### Suggested implementation bias for the next phase
+
+Prefer a **rule-based planner first**, with optional LCEL prompt enrichment later.
+
+That keeps:
+
+- tests stable
+- degraded mode deterministic
+- provider behavior observable
+- implementation complexity under control
 
 ---
 
@@ -388,51 +508,42 @@ This respects the current pipeline while preparing for subtitles, visual synchro
 
 ### Question 1
 
-Should the first implementation of the voice module keep `PipelineState` minimal with only `audio_path`, or should it
-immediately add optional timing metadata fields for subtitles and video timing?
+The request references the external `project-sma` prompt, but the active workspace and local prompt clearly target
+Shorts Factory. Should future phases continue using the **Shorts Factory interpretation**?
 
-Answer: Keep `audio_path` as the only required field for the first implementation, but add optional timing metadata
-immediately if it can be produced cleanly without complicating the core contract. My recommendation is to add optional
-segment-oriented fields such as `audio_segments` and `audio_duration_ms`, while deferring heavier or more
-provider-specific metadata until a downstream consumer actually requires it.
+Answer: only Shorts Factory
 
 ### Question 2
 
-Do you want provider selection to be strictly configuration-driven for v1, or should the design already support per-job
-voice/provider overrides inside `PipelineState`?
+For V1 of the Visual Agent, should the module support:
 
-Answer: For v1, provider selection should be configuration-driven. This keeps the first implementation simpler, easier
-to test, and more consistent with the current repository style. Per-job overrides can be added later, but only once
-there is a concrete product need and a clear `PipelineState` contract for passing voice preferences safely through the
-pipeline.
+- stock **video clips only**, or
+- a mix of **video clips + still images + local library assets** from day one?
+
+Answer: a mix of video clips and still images, with a clear provider abstraction to add local library assets later.
 
 ### Question 3
 
-Is degraded mode expected to remain silent audio only, or would you prefer a lightweight local spoken fallback once the
-architecture is in place?
+Should timing be derived primarily from `audio_segments`, or is a simpler `hook/body/cta` equal-split approach
+acceptable for the first implementation?
 
-Answer: Degraded mode should remain silent audio for the first implementation. It is the lowest-risk fallback, fully
-aligned with the current project conventions, and ensures the pipeline always runs end-to-end. Once the provider
-abstraction is in place, a lightweight spoken local fallback can be introduced later behind the same interface without
-changing the pipeline surface.
+Answer: primarily from `audio_segments`, since that metadata is already available and provides better alignment. The
+equal-split approach can be a fallback if `audio_segments` is missing or malformed.
 
 ### Question 4
 
-For downstream consumers, is segment-level timing (`hook`, `body`, `cta`) sufficient, or do you expect word-level
-timestamps from the very first implementation?
+Should the future public state contract replace `image_paths` with a richer `visual_assets` manifest, or should the
+implementation keep `image_paths` as the main output despite its limitations?
 
-Answer: Segment-level timing is sufficient for the first implementation. It maps naturally to the current structured
-script shape (`hook`, `body`, `cta`) and gives downstream tools enough information to improve subtitle placement and
-visual pacing. Word-level timestamps should be treated as a future enhancement when subtitle precision becomes an
-explicit requirement.
+Answer: the future public state contract should replace `image_paths` with a richer `visual_assets` manifest that
+includes metadata for each asset. This provides a more robust and extensible foundation for downstream tools, even if it
+requires updates to `VideoAssemblyTool` later.
 
 ### Question 5
 
-Should the voice module normalize and chunk long body text automatically, even if that means the generated audio no
-longer maps one-to-one to the original raw strings?
+Is optional LLM-assisted visual prompt generation acceptable in V1, or should the first implementation remain fully
+deterministic and provider-driven?
 
-Answer: Yes, the voice module should normalize and chunk long body text automatically, but it should do so in a
-controlled way that preserves traceability. The renderer should keep a mapping between original script sections and
-rendered chunks so downstream components can still relate timing metadata back to `hook`, `body`, and `cta` even if the
-spoken audio is optimized for cadence and provider limits.
+Answer: Remaining fully deterministic and provider-driven in V1 is preferable to keep tests stable and behavior
+predictable. LLM-assisted prompt generation can be added in a later iteration once the base architecture is solid.
 

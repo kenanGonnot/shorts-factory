@@ -25,6 +25,23 @@ class Settings(BaseSettings):
 
     # Visuals
     pexels_api_key: str = ""
+    # Provider strategy: ``section_map`` uses per-section defaults from
+    # ``visual_provider_map``; ``pexels``/``nano_banana``/``fallback``
+    # force a single provider for all sections.
+    visual_provider: str = "section_map"
+    visual_provider_map: dict[str, str] = {
+        "hook": "nano_banana",
+        "body": "pexels",
+        "cta": "nano_banana",
+    }
+    visual_ai_model: str = "gemini-3.1-flash-image"  # Nano Banana 2
+    google_api_key: str = ""
+    # Nano Banana (Gemini image) — dedicated env keys. When set, take
+    # precedence over ``google_api_key`` / ``visual_ai_model`` in
+    # ``build_providers``. Pydantic-settings maps NANO_BANANA_API_KEY /
+    # NANO_BANANA_MODEL from ``.env`` automatically.
+    nano_banana_api_key: str = ""
+    nano_banana_model: str = ""
 
     # YouTube
     youtube_client_secrets_file: str = ""

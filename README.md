@@ -1,40 +1,26 @@
 # Shorts Factory
 
-Pipeline automatisée de génération et publication de **YouTube Shorts**, orchestrée avec **LangChain (LCEL)**.
+Pipeline automatisée de génération et de publication de **YouTube Shorts** orchestrée avec **LangChain LCEL**.
 
-```
-graph TD
-    A[Topic Input] --> B[ScriptChain]
-    B --> C[VoiceTool]
-    C --> D[VisualTool]
-    D --> E[VideoAssemblyTool]
-    E --> F[SubtitleTool]
-    F --> G[PublishingTool]
-    G --> H[YouTube Shorts]
-```
 ```
 topic → ScriptChain → VoiceTool → VisualTool → VideoAssemblyTool → SubtitleTool → PublishingTool
 ```
 
-
-Chaque étape est un `Runnable[PipelineState, PipelineState]` composable avec l'opérateur `|`. Le pipeline complet est défini dans `app/chains/pipeline.py`.
+À partir d'un topic, le projet produit un short vertical complet et peut l'uploader sur YouTube. Sans credentials, le pipeline continue à tourner en **mode dégradé** : script déterministe, audio silencieux, visuels offline et publication en dry-run.
 
 ---
 
 ## ✨ Fonctionnalités
 
-- **Génération de script** via `ScriptGenerator` avec sortie structurée validée par schéma
-- **Text-to-Speech** (ElevenLabs, fallback ffmpeg silence en dev)
-- **Visuels** stock (Pexels, fallback couleur unie)
-- **Assemblage vidéo** ffmpeg en 1080×1920 (format Shorts)
-- **Sous-titres** SRT générés et incrustés
-- **Upload YouTube Shorts** automatique
-- **Jobs asynchrones** via Celery + Redis
-- **Persistance** PostgreSQL (jobs, assets, métriques)
-- **Stockage** local ou S3-compatible
-- **Observabilité** : logs structurés JSON via `structlog`
-- **CLI Typer** pour déclencher manuellement le pipeline
-- **Dockerisé** : `docker compose up` et c'est parti
+- Génération de script structurée via `ScriptGenerator`
+- Text-to-Speech avec `ElevenLabs` ou fallback silencieux
+- Orchestration visuelle par section (`hook`, `body`, `cta`) avec providers interchangeables
+- Normalisation et assemblage vidéo via `ffmpeg` en 1080x1920
+- Génération de sous-titres SRT et burn-in
+- Upload YouTube automatisé avec mode dry-run sans secrets
+- API FastAPI, workers Celery, persistance PostgreSQL
+- Stockage local ou S3-compatible
+- Logs JSON via `structlog`
 
 ---
 
@@ -42,99 +28,24 @@ Chaque étape est un `Runnable[PipelineState, PipelineState]` composable avec l'
 
 | Couche | Choix |
 |---|---|
-| Langage | Python 3.10 |
+| Langage | Python 3.10+ |
+| Pipeline | LangChain LCEL (`Runnable \|`) |
 | API | FastAPI + Uvicorn |
-| Orchestration | **LangChain LCEL** (Runnable) |
 | Jobs | Celery + Redis |
 | DB | PostgreSQL + SQLAlchemy 2 |
 | Vidéo | ffmpeg |
-| Stockage | local / S3 (boto3) |
-| Config | pydantic-settings (`.env`) |
-| Logs | structlog (JSON) |
+| Stockage | local / S3-compatible |
+| Config | `pydantic-settings` |
+| Logs | `structlog` |
 | Conteneurs | Docker + docker-compose |
 
 ---
 
-## 📁 Structure du projet
+## 🧠 Architecture
 
-```
-shorts-factory/
-├── app/
-│   ├── api/main.py              # FastAPI : POST /generate, GET /jobs/{id}
-│   ├── core/                    # config, logging, db
-│   ├── chains/
-│   │   ├── state.py             # PipelineState (TypedDict)
-│   │   ├── script_chain.py      # Adaptateur Runnable pour l'étape script
-│   │   ├── script_generator.py  # Génération structurée + validation + fallback
-│   │   └── pipeline.py          # build_pipeline() — composition LCEL
-│   ├── tools/
-│   │   ├── base.py              # PipelineTool(Runnable)
-│   │   ├── voice_tool.py        # TTS
-│   │   ├── visual_tool.py       # stock footage
-│   │   ├── video_tool.py        # ffmpeg assembly
-│   │   ├── subtitle_tool.py     # SRT + burn-in
-│   │   └── publish_tool.py      # YouTube upload
-│   ├── services/                # storage (local/S3), youtube client
-│   ├── models/video.py          # VideoJob, VideoAsset, Metric
-│   └── workers/                 # Celery app + tasks
-├── scripts/run_pipeline.py      # CLI Typer
-├── tests/                       # smoke tests
-├── docker-compose.yml
-├── Dockerfile
-├── pyproject.toml
-└── .env.example
-```
-
----
-
-## 🚀 Démarrage rapide
-
-### 1. Cloner et configurer
-
-```bash
-git clone <repo>
-cd shorts-factory
-cp .env.example .env
-# Éditez .env (clés API optionnelles — le pipeline tourne en mode dégradé sans elles)
-```
- 
-### 2. Lancer avec Docker
-
-```bash
-docker compose up --build
-```
-
-Services exposés :
-- API → `http://localhost:8000` (Swagger sur `/docs`)
-- Postgres → `localhost:5432`
-- Redis → `localhost:6379`
-- Worker Celery → en background
-
-### 3. Déclencher un job
-
-**Via API :**
-```bash
-curl -X POST localhost:8000/generate \
-  -H 'content-type: application/json' \
-  -d '{"topic": "3 surprising facts about octopuses"}'
-# → {"job_id": "...", "status": "pending"}
-
-curl localhost:8000/jobs/<job_id>
-```
-
-**Via CLI :**
-```bash
-python -m scripts.run_pipeline "Why coffee makes you focus"
-```
-
----
-
-## 🧠 Flow LangChain
-
-Le pipeline complet est **une seule expression LCEL** :
+Le pipeline complet est défini dans `app/chains/pipeline.py` :
 
 ```python
-# app/chains/pipeline.py
 def build_pipeline() -> Runnable:
     return (
         build_script_chain()
@@ -146,33 +57,143 @@ def build_pipeline() -> Runnable:
     )
 ```
 
-Un `PipelineState` (TypedDict) traverse les étapes et s'enrichit à chaque passage : `script`, `audio_path`, `image_paths`, `video_path`, `subtitle_path`, `final_path`, `youtube_id`.
+Chaque étape échange un unique `PipelineState` qui s'enrichit au fil du run. Les principaux champs produits sont :
 
-`ScriptChain` reste l'entrée LCEL du pipeline, mais l'implémentation est maintenant déléguée à `ScriptGenerator`, qui:
-- génère un script structuré via `ChatOpenAI.with_structured_output(...)`
-- valide le payload via un schéma Pydantic
-- applique un fallback déterministe quand `OPENAI_API_KEY` est absent
+| Champ | Produit par |
+|---|---|
+| `script` | `ScriptChain` |
+| `audio_path`, `audio_segments`, `audio_segments_path` | `VoiceTool` |
+| `visual_assets` | `VisualTool` |
+| `video_path` | `VideoAssemblyTool` |
+| `subtitle_path`, `final_path` | `SubtitleTool` |
+| `youtube_id` | `PublishingTool` |
 
-Les autres tools héritent de `PipelineTool(Runnable[State, State])` — isolés, testables individuellement, et swappables (changer ElevenLabs → Coqui = modifier un seul fichier).
+Le module visuel repose sur trois briques internes :
+- `VisualPlanner` : transforme le script et la voix en slots visuels
+- `VisualProvider` : résout chaque slot (`pexels`, `nano_banana`, `fallback`)
+- `VisualNormalizer` : convertit tout en clips MP4 homogènes avant assemblage
+
+Par défaut, la stratégie visuelle est `section_map` :
+- `hook` → `nano_banana`
+- `body` → `pexels`
+- `cta` → `nano_banana`
+
+---
+
+## 📁 Structure du projet
+
+```
+shorts-factory/
+├── app/
+│   ├── api/main.py
+│   ├── chains/
+│   ├── core/
+│   ├── services/
+│   ├── tools/
+│   ├── visual/
+│   ├── voice/
+│   ├── workers/
+│   └── models/video.py
+├── scripts/run_pipeline.py
+├── tests/
+├── docs/
+├── docker-compose.yml
+├── Dockerfile
+├── pyproject.toml
+└── .env.example
+```
+
+---
+
+## 🚀 Démarrage rapide
+
+### 1. Prérequis
+
+- Python 3.10+
+- `ffmpeg`
+- Docker + Docker Compose si vous voulez lancer l'API, Redis et Postgres ensemble
+
+### 2. Installation locale
+
+```bash
+git clone <repo>
+cd shorts-factory
+cp .env.example .env
+pip install -e ".[dev]"
+```
+
+### 3. Exécuter un run complet en CLI
+
+```bash
+python -m scripts.run_pipeline "3 surprising facts about octopuses"
+```
+
+### 4. Lancer la stack complète
+
+```bash
+docker compose up --build
+```
+
+Services exposés :
+- API : `http://localhost:8000`
+- Swagger : `http://localhost:8000/docs`
+- Redis : `localhost:6379`
+- PostgreSQL : `localhost:5432`
+
+---
+
+## 🌐 API
+
+### Créer un job
+
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "content-type: application/json" \
+  -d '{"topic": "Why coffee makes you focus"}'
+```
+
+Réponse :
+
+```json
+{"job_id":"<uuid>","status":"pending"}
+```
+
+### Lire l'état d'un job
+
+```bash
+curl http://localhost:8000/jobs/<job_id>
+```
+
+### Vérifier la santé du service
+
+```bash
+curl http://localhost:8000/health
+```
 
 ---
 
 ## ⚙️ Variables d'environnement
 
-Voir `.env.example`. Les principales :
+Le template minimal est `.env.example`. Les réglages avancés sont définis dans `app/core/config.py`.
 
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | Clé LLM |
-| `LLM_MODEL` | Modèle (défaut: `gpt-4o-mini`) |
-| `ELEVENLABS_API_KEY` | TTS (optionnel en dev) |
-| `PEXELS_API_KEY` | Stock footage (optionnel) |
-| `YOUTUBE_CLIENT_SECRETS_FILE` | OAuth Google (optionnel — dryrun sinon) |
-| `STORAGE_BACKEND` | `local` ou `s3` |
-| `DATABASE_URL` | URL Postgres |
-| `REDIS_URL` | URL Redis |
-
-> Sans aucune clé API, le pipeline tourne en **mode dégradé** : audio silencieux, clip couleur unie, upload YouTube en dryrun. Idéal pour valider la plomberie.
+| Variable | Défaut | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | `""` | clé LLM ; vide → fallback déterministe |
+| `LLM_MODEL` | `gpt-4o-mini` | modèle OpenAI |
+| `VOICE_PROVIDER` | `auto` | `auto` \| `elevenlabs` \| `silent` |
+| `ELEVENLABS_API_KEY` | `""` | clé TTS ; vide → silence |
+| `PEXELS_API_KEY` | `""` | clé stock footage |
+| `GOOGLE_API_KEY` | `""` | clé Gemini image générique |
+| `NANO_BANANA_API_KEY` | `""` | clé dédiée au provider image |
+| `NANO_BANANA_MODEL` | `""` | override du modèle visuel |
+| `VISUAL_PROVIDER` | `section_map` | `section_map` \| `pexels` \| `nano_banana` \| `fallback` |
+| `YOUTUBE_CLIENT_SECRETS_FILE` | `""` | secrets OAuth YouTube ; vide → dry-run |
+| `YOUTUBE_TOKEN_FILE` | `""` | token OAuth persisté |
+| `YOUTUBE_PRIVACY` | `private` | visibilité de publication |
+| `STORAGE_BACKEND` | `local` | `local` \| `s3` |
+| `STORAGE_LOCAL_DIR` | `./storage` | stockage local |
+| `DATABASE_URL` | `postgresql+psycopg://shorts:shorts@localhost:5432/shorts` | PostgreSQL |
+| `REDIS_URL` | `redis://localhost:6379/0` | broker / backend Celery |
 
 ---
 
@@ -180,29 +201,22 @@ Voir `.env.example`. Les principales :
 
 ```bash
 pytest
+ruff check app/
 ```
 
-Le test smoke (`tests/test_pipeline.py`) compose le pipeline avec des stubs et vérifie que le `PipelineState` traverse toutes les étapes.
+Les tests couvrent :
+- la configuration et les fallbacks
+- la génération de script
+- la voix et les métadonnées de segments
+- le pipeline visuel
+- la composition LCEL de bout en bout
 
 ---
 
 ## 🔌 Extensibilité
 
-- **Nouveau provider TTS** : créer une classe qui hérite de `PipelineTool` avec le même contrat d'état, l'importer dans `pipeline.py`.
-- **Nouvelle étape** : insérer un nouveau Runnable dans la chaîne (ex: `MusicTool`, `ThumbnailTool`).
-- **Multi-Agent (MAS)** : la composition LCEL est compatible avec LangGraph — remplacer `build_pipeline()` par un graphe pour gérer branches conditionnelles, retries, ou validation humaine.
-- **Nouveau backend de stockage** : implémenter `Storage` dans `app/services/storage.py`.
+- Ajouter un nouveau tool : créer un `PipelineTool`, étendre `PipelineState`, puis l'insérer dans `build_pipeline()`.
+- Ajouter un provider voix ou visuel : encapsuler l'intégration dans `app/voice/` ou `app/visual/` avec lazy-init et fallback.
+- Passer à LangGraph : possible tant que le contrat `PipelineState` reste stable pour les tools existants.
 
----
-
-## 📊 Observabilité
-
-- Logs structurés JSON via `structlog`
-- Événements `tool.start` / `tool.end` / `tool.error` par étape avec `job_id`
-- Compatible avec **LangSmith** : ajouter `LANGCHAIN_TRACING_V2=true` et `LANGCHAIN_API_KEY` dans `.env`
-
----
-
-## 📜 Licence
-
-MIT — voir `LICENSE` (à ajouter).
+Les règles de contribution détaillées vivent dans `AGENTS.md`.

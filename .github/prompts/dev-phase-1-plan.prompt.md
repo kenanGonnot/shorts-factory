@@ -21,6 +21,7 @@ The `implementation-plan.md` should contain these sections:
 5. Ask clarification on unclear topic.
    * Ask questions
    * Write "Answer: " under the question and leave it blank for the user to fill in later.
+   * "GPT recommendation: " under the answer section to give your recommendation on the best solution to implement based on the analysis.
 
 
 Constraints:

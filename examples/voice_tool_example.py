@@ -41,7 +41,7 @@ def main() -> None:
 
     print(f"Using provider: {provider.config.provider} (voice={provider.config.voice_id})")
 
-    state: PipelineState = {"job_id": "demo", "topic": "typing", "script": script}
+    state: PipelineState = {"job_id": "voice_demo", "topic": "typing", "script": script}
     out = tool.run(state)
 
     print("audio_path        :", out["audio_path"])
