@@ -17,7 +17,7 @@ topic → ScriptChain → VoiceTool → VisualTool → VideoAssemblyTool → Sub
 - Orchestration visuelle par section (`hook`, `body`, `cta`) avec providers interchangeables
 - Normalisation et assemblage vidéo via `ffmpeg` en 1080x1920
 - Génération de sous-titres SRT et burn-in
-- Upload YouTube automatisé avec mode dry-run sans secrets
+- Upload YouTube automatisé avec runtime headless et dry-run déterministe sans credentials valides
 - API FastAPI, workers Celery, persistance PostgreSQL
 - Stockage local ou S3-compatible
 - Logs JSON via `structlog`
@@ -176,6 +176,11 @@ curl http://localhost:8000/health
 
 Le template minimal est `.env.example`. Les réglages avancés sont définis dans `app/core/config.py`.
 
+Le module de publication reste **headless** à l'exécution: il réutilise un token
+OAuth déjà présent dans `YOUTUBE_TOKEN_FILE`. Si le fichier de secrets ou le
+token manque, `PublishingTool` ne tente aucun upload et renvoie un `youtube_id`
+déterministe de la forme `dryrun-<job_id>`.
+
 | Variable | Défaut | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | `""` | clé LLM ; vide → fallback déterministe |
@@ -187,9 +192,9 @@ Le template minimal est `.env.example`. Les réglages avancés sont définis dan
 | `NANO_BANANA_API_KEY` | `""` | clé dédiée au provider image |
 | `NANO_BANANA_MODEL` | `""` | override du modèle visuel |
 | `VISUAL_PROVIDER` | `section_map` | `section_map` \| `pexels` \| `nano_banana` \| `fallback` |
-| `YOUTUBE_CLIENT_SECRETS_FILE` | `""` | secrets OAuth YouTube ; vide → dry-run |
-| `YOUTUBE_TOKEN_FILE` | `""` | token OAuth persisté |
-| `YOUTUBE_PRIVACY` | `private` | visibilité de publication |
+| `YOUTUBE_CLIENT_SECRETS_FILE` | `""` | fichier de secrets OAuth ; avec le token, active l'upload réel |
+| `YOUTUBE_TOKEN_FILE` | `""` | token OAuth persisté déjà généré ; vide ou absent → dry-run |
+| `YOUTUBE_PRIVACY` | `private` | visibilité souhaitée : `public`, `private` ou `unlisted` |
 | `STORAGE_BACKEND` | `local` | `local` \| `s3` |
 | `STORAGE_LOCAL_DIR` | `./storage` | stockage local |
 | `DATABASE_URL` | `postgresql+psycopg://shorts:shorts@localhost:5432/shorts` | PostgreSQL |

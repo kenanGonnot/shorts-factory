@@ -4,11 +4,11 @@ description: 'Analyze and brainstorm multiple solutions for the project describe
 
 # Goal
 
-{{Design the next step of an automated YouTube Shorts pipeline: a Subtitle Generation module using Python and ffmpeg,
-integrated as a LangChain-compatible tool. The goal is to transform an assembled vertical video plus existing narration
-and timing metadata into a deterministic `.srt` file and a final MP4 with burned-in captions. The output must be
-synchronized with the narration timeline, readable on mobile, and directly reusable by the downstream publishing
-component.}}
+{{Design the next step of an automated YouTube Shorts pipeline: a Publishing module using Python and the YouTube Data
+API, integrated as a LangChain-compatible tool. The goal is to transform the final subtitled vertical video plus
+structured script metadata into a publish-ready upload flow that either returns a real YouTube video identifier or a
+deterministic dry-run result when credentials are missing. The output must preserve clean pipeline contracts, support
+degraded mode without secrets, and be directly reusable by the job tracking and API layers.}}
 
 ## Thinking Process
 
@@ -20,37 +20,39 @@ normal and degraded modes.}}
 
 ### 1. Gather and Analyze Project Information
 
-{{Understand that this module consumes `video_path` produced by `VideoAssemblyTool` and subtitle text/timing context
-already present in the pipeline state, primarily `script` and, when available, `audio_segments`, `audio_segments_path`,
-and `audio_duration_ms` produced by `VoiceTool`. It is part of a larger LCEL pipeline, so the design must emphasize
-modularity, clear input/output contracts, and strict compliance with the `PipelineState` contract from `AGENTS.md`. The
-system should account for:
+{{Understand that this module consumes `final_path` produced by `SubtitleTool` and the structured `script` metadata
+already present in the pipeline state, especially `title`, `hook`, `body`, `cta`, and `tags`. It is part of a larger
+LCEL pipeline, so the design must emphasize modularity, clear input/output contracts, and strict compliance with the
+`PipelineState` contract from `AGENTS.md`. The system should account for:
 
-- deterministic caption generation from existing narration chunks instead of depending on external transcription
-  services
-- silent-audio / offline degraded mode while still producing a valid `.srt` and burned-in final video
-- mobile-readable subtitle styling for a 1080x1920 vertical video
-- deterministic output storage keyed by `job_id`
+- upload of the final 9:16 MP4 through a clean service wrapper instead of embedding YouTube API details directly in the
+  tool
+- deterministic degraded mode when `YOUTUBE_CLIENT_SECRETS_FILE` or related credentials are missing
+- metadata construction from the generated script, including title, description, tags, and privacy settings
+- idempotent or at least stable behavior keyed by `job_id` when possible, so repeated runs remain predictable
 
-The output should be a subtitle file path (`subtitle_path`) and a final burned-in MP4 path (`final_path`) representing
-the publishing-ready video generated from the assembled video plus synchronized captions.}}
+The output should be a YouTube identifier field (`youtube_id`) representing either the real uploaded video id or a
+stable dry-run value when publication is skipped.}}
 
 ### 2. Algorithm
 
-{{Design a pipeline that takes the assembled video and subtitle text/timing metadata as input and produces subtitle
-artifacts. Steps:
+{{Design a pipeline that takes the finalized short and script metadata as input and produces a publication result.
+Steps:
 
-- Input: `video_path` + `script` + optional `audio_segments`, `audio_segments_path`, and `audio_duration_ms`
-- Validate that the referenced video exists and that subtitle timing data is available or can be deterministically
-  reconstructed from the script
-- Convert narration/script content into subtitle cues with start/end timestamps and readable line-breaking/chunking
-  rules
-- Serialize the subtitle cues into an `.srt` file stored at a deterministic path for the current `job_id`
-- Build an ffmpeg burn-in strategy for rendering readable captions onto the vertical video without disturbing the
-  existing audio track
-- Export the final subtitled MP4 to a deterministic storage path for the current `job_id`
-- Validate the resulting `.srt` and MP4 artifacts (exist, playable, duration remains coherent, ready for publishing)
-- Return `subtitle_path` and `final_path` for downstream `PublishingTool`
+- Input: `final_path` + `script`
+- Validate that the referenced final video exists and that the minimum publication metadata can be derived from the
+  script
+- Build upload metadata deterministically from the script, including a Shorts-friendly title, description, tags, and
+  configured privacy status
+- Resolve publishing mode from configuration: real YouTube upload when OAuth credentials are available, or degraded
+  dry-run otherwise
+- In real upload mode, initialize the YouTube client lazily, submit the MP4 upload, and capture the returned remote
+  video identifier
+- In dry-run mode, emit a stable placeholder identifier and structured logs that clearly explain why publication was
+  skipped
+- Validate the publication result so downstream API, worker, and persistence layers can rely on a single `youtube_id`
+  contract
+- Return `youtube_id` for the completed pipeline state
   }}
 
 #### Behavioral Rules
